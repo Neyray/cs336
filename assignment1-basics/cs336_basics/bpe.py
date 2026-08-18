@@ -1,5 +1,7 @@
+from multiprocessing import Pool
 from collections import Counter
 import regex as re
+import os
 
 
 # GPT-2 pre-tokenization regex
@@ -24,6 +26,17 @@ def merge_sequence(
             result.append(sequence[i])
             i+=1
     return tuple(result)
+
+
+# 统计单词出现次数
+def count_pretokens(part):
+    counts = Counter()
+
+    for match in re.finditer(PATTERN, part):  # 在一段字符串中，按照正则表达式依次寻找所有匹配内容，并返回每一个匹配结果
+        counts[match.group()] += 1
+
+    return counts
+
 
 def train_bpe(
     input_path:str,
@@ -66,16 +79,20 @@ def train_bpe(
 
     
     # 定义pretoken_counts统计单词出现次数
-    pretoken_counts=Counter()
-    for part in parts:
-        for match in re.finditer(PATTERN,part):
-            token=match.group()
-            pretoken_counts[token]+=1
+    num_workers = min(8, os.cpu_count())
+    # 创建一个包含 8 个 worker 进程的进程池
+    with Pool(num_workers) as pool:
+        counters = pool.map(count_pretokens, parts)
+
+    pretoken_counts = Counter()
+
+    for counter in counters:
+        pretoken_counts.update(counter)   # 相同 key 在 update() 时会把数字相加，而普通 dict 的 update() 是覆盖，Counter类型和dict类型很相似，都是键值对
 
     
 
     # 定义token_counts将字母中的序列展开统计
-    # dict类型
+    # Counter类型
     token_counts=Counter()
     for token,count in pretoken_counts.items():
         encoded=token.encode("utf-8")
@@ -89,8 +106,8 @@ def train_bpe(
 
     
     # 定义pair_counts统计相邻字符数量
-    pair_counts=Counter()   # dict类型
-    pair_to_sequences={}   # dict类型
+    pair_counts=Counter()   # Counter类型
+    pair_to_sequences={}   # Counter类型
 
     for sequence,count in token_counts.items():
         for i in range(len(sequence)-1):
@@ -168,7 +185,7 @@ def train_bpe(
                 if not pair_to_sequences[pair]:
                     del pair_to_sequences[pair]
 
-        merge_counts=Counter()  # dict类型
+        merge_counts=Counter()  # Counter类型
         for sequence,count in affected_info:
             new_sequence=merge_sequence(sequence,best_pair)
 
