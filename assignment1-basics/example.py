@@ -6,100 +6,256 @@ import regex as re
 PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
-# pair表示这一轮准备执行merge的两个字符
-# sequence表示一个 tuple，里面有任意多个 bytes 对象
+# 对一个 sequence 中指定的 pair 进行合并
 def merge_sequence(
     sequence: tuple[bytes, ...],
     pair: tuple[bytes, bytes],
 ) -> tuple[bytes, ...]:
 
-    result = []
+    results = []
     i = 0
 
     while i < len(sequence):
+
         if (
             i < len(sequence) - 1
             and sequence[i] == pair[0]
             and sequence[i + 1] == pair[1]
         ):
-            result.append(pair[0] + pair[1])   #如果相等，就把这两个更新为一个存到result里面
+            results.append(pair[0] + pair[1])
             i += 2
+
         else:
-            result.append(sequence[i])
+            results.append(sequence[i])
             i += 1
-    # result是新的tuple序列
-    return tuple(result)
+
+    return tuple(results)
 
 
-# vocab 保存“学到了哪些 token”（最终的词表），merges 保存“这些 token 是按什么顺序合并出来的”，也就是pair的集合
+# 根据输入文本训练 BPE
 def train_bpe(
     input_path: str,
     vocab_size: int,
     special_tokens: list[str],
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
 
-    # 1. 初始化 256 个 byte token
+    # ------------------------------------------------
+    # 1. 初始化 vocab：256 个 byte
+    # ------------------------------------------------
+
     vocab = {
         i: bytes([i])
         for i in range(256)
     }
 
+    merges = []
+
+
+    # ------------------------------------------------
     # 2. 加入 special tokens
+    # ------------------------------------------------
+
     for token in special_tokens:
         vocab[len(vocab)] = token.encode("utf-8")
 
-    if vocab_size < len(vocab):
-        raise ValueError("vocab_size 太小")
+    if len(vocab) > vocab_size:
+        raise ValueError("vocab_size太小")
 
-    merges = []
 
+    # ------------------------------------------------
     # 3. 读取训练文本
+    # ------------------------------------------------
+
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
 
-    # 4. special token 作为硬边界切开
+
+    # ------------------------------------------------
+    # 4. special token 作为硬边界
+    # ------------------------------------------------
+
     if special_tokens:
+
         special_pattern = "|".join(
             re.escape(token)
             for token in special_tokens
         )
-        parts = re.split(special_pattern, text)
+
+        parts = re.split(
+            special_pattern,
+            text,
+        )
+
     else:
         parts = [text]
 
-    # 5. pre-tokenization + 统计频率
+
+    # ------------------------------------------------
+    # 5. pre-tokenization
+    # ------------------------------------------------
+
     pretoken_counts = Counter()
-    # 创建一个计数器
 
     for part in parts:
-        # re.finditer() 会根据正则表达式 PATTERN，在文本中寻找所有匹配的位置
-        for match in re.finditer(PATTERN, part):  # 这里的 match 不是字符串，而是一个正则匹配对象
-            token = match.group()  # 获取这个匹配对象实际匹配到的字符串
+
+        for match in re.finditer(PATTERN, part):
+
+            token = match.group()
+
             pretoken_counts[token] += 1
 
-    # 6. 每个 pre-token 转换成 byte token 序列
+
+    # ------------------------------------------------
+    # 6. 将 pre-token 转换为 byte sequence
+    #
+    # 例如：
+    #
+    # "low" 出现 5 次
+    #
+    # →
+    #
+    # (b'l', b'o', b'w') : 5
+    # ------------------------------------------------
+
     token_counts = Counter()
 
     for token, count in pretoken_counts.items():
 
         encoded = token.encode("utf-8")
 
-        # 此时的encoded是数字，要转换成字符再存储到token_counts里面
         sequence = tuple(
             bytes([byte])
             for byte in encoded
         )
-        # 例：token_counts[(b"l", b"o", b"w")] = 5
+
         token_counts[sequence] += count
 
-    # 7. BPE merge
+
+    # ------------------------------------------------
+    # 7. 初始 pair_counts
+    #
+    # pair_counts[(a,b)] = (a,b) 的总出现次数
+    # ------------------------------------------------
+
+    pair_counts = Counter()
+
+
+    # ------------------------------------------------
+    # pair_to_sequences:
+    #
+    # 一个 pair 出现在哪些 sequence 中
+    #
+    # 例如：
+    #
+    # (a,b) →
+    # {
+    #     (a,b,c),
+    #     (a,b,x)
+    # }
+    #
+    # 用于增量更新
+    # ------------------------------------------------
+
+    pair_to_sequences = {}
+
+
+    for sequence, count in token_counts.items():
+
+        for i in range(len(sequence) - 1):
+
+            pair = (
+                sequence[i],
+                sequence[i + 1],
+            )
+
+            pair_counts[pair] += count
+
+            if pair not in pair_to_sequences:
+                pair_to_sequences[pair] = set()
+
+            pair_to_sequences[pair].add(sequence)
+
+
+    # ------------------------------------------------
+    # 8. BPE merge 主循环
+    # ------------------------------------------------
+
     while len(vocab) < vocab_size:
 
-        pair_counts = Counter()
+        # 没有 pair 可以继续 merge
+        if not pair_counts:
+            break
 
-        # 统计所有相邻 token pair
-        # 把sequence的相邻字符取出来
-        for sequence, count in token_counts.items():
+
+        # --------------------------------------------
+        # 找最高频 pair
+        #
+        # 如果频率相同：
+        # 选择字典序最大的
+        # --------------------------------------------
+
+        best_pair = max(
+            pair_counts,
+            key=lambda pair: (
+                pair_counts[pair],
+                pair,
+            ),
+        )
+
+
+        # 记录 merge
+        merges.append(best_pair)
+
+
+        # 新 token
+        best_token = (
+            best_pair[0]
+            + best_pair[1]
+        )
+
+        vocab[len(vocab)] = best_token
+
+
+        # --------------------------------------------
+        # 只找到包含 best_pair 的 sequence
+        # --------------------------------------------
+
+        affected_sequences = list(
+            pair_to_sequences.get(
+                best_pair,
+                set(),
+            )
+        )
+
+
+        # 保存：
+        #
+        # sequence
+        # sequence 出现次数
+        # --------------------------------------------
+
+        affected_info = [
+            (
+                sequence,
+                token_counts[sequence],
+            )
+            for sequence in affected_sequences
+        ]
+
+
+        # --------------------------------------------
+        # 9. 删除旧 sequence 对 pair_counts 的贡献
+        # --------------------------------------------
+
+        for sequence, count in affected_info:
+
+            # 删除旧 token sequence
+            del token_counts[sequence]
+
+
+            # set 用来更新 pair_to_sequences
+            old_pairs = set()
+
 
             for i in range(len(sequence) - 1):
 
@@ -108,42 +264,95 @@ def train_bpe(
                     sequence[i + 1],
                 )
 
-                pair_counts[pair] += count
+                old_pairs.add(pair)
 
-        # 已经没有可以合并的 pair
-        if not pair_counts:
-            break
 
-        # 频率最高；
-        # 如果频率相同，选择字典序最大的 pair
-        best_pair = max(
-            pair_counts,
-            key=lambda pair: (
-                pair_counts[pair],
-                pair,  # pair表示字典序
-            ),
-        )
+                # 注意：
+                #
+                # 如果一个 pair 在同一个 sequence
+                # 中出现多次，这里会执行多次，
+                # 所以 pair_counts 会正确减掉多次
+                # ------------------------------------
 
-        # 保存 merge
-        merges.append(best_pair)
+                pair_counts[pair] -= count
 
-        # 新 token 加入 vocab
-        new_token = best_pair[0] + best_pair[1]
+                if pair_counts[pair] <= 0:
+                    del pair_counts[pair]
 
-        vocab[len(vocab)] = new_token
 
-        # 对所有 pre-token 应用本轮 merge
-        new_token_counts = Counter()
+            # ----------------------------------------
+            # 从倒排索引中删除旧 sequence
+            # ----------------------------------------
 
-        for sequence, count in token_counts.items():
+            for pair in old_pairs:
+                # pair是pair_to_sequences的索引
+                if pair in pair_to_sequences:
+
+                    pair_to_sequences[pair].discard(
+                        sequence
+                    )
+
+                    if not pair_to_sequences[pair]:
+
+                        del pair_to_sequences[pair]
+
+
+        # --------------------------------------------
+        # 10. 对受到影响的 sequence 执行 merge
+        # --------------------------------------------
+
+        merged_counts = Counter()
+
+
+        for sequence, count in affected_info:
 
             new_sequence = merge_sequence(
                 sequence,
                 best_pair,
             )
 
-            new_token_counts[new_sequence] += count
+            merged_counts[new_sequence] += count
 
-        token_counts = new_token_counts
+
+        # --------------------------------------------
+        # 11. 把 merge 后的新 sequence 加回去
+        # --------------------------------------------
+
+        for sequence, added_count in merged_counts.items():
+
+            token_counts[sequence] += added_count
+
+
+            new_pairs = set()
+
+
+            for i in range(len(sequence) - 1):
+
+                pair = (
+                    sequence[i],
+                    sequence[i + 1],
+                )
+
+                new_pairs.add(pair)
+
+
+                # 新增 pair 的频率
+                pair_counts[pair] += added_count
+
+
+            # ----------------------------------------
+            # 更新 pair → sequence 索引
+            # ----------------------------------------
+
+            for pair in new_pairs:
+
+                if pair not in pair_to_sequences:
+
+                    pair_to_sequences[pair] = set()
+
+                pair_to_sequences[pair].add(
+                    sequence
+                )
+
 
     return vocab, merges

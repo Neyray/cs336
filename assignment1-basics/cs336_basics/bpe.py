@@ -1,116 +1,200 @@
 from collections import Counter
 import regex as re
 
+
 # GPT-2 pre-tokenization regex
 PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-# 对一组序列进行合并，更新序列
+# 根据pair来更新现有序列
 def merge_sequence(
     sequence:tuple[bytes,...],
     pair:tuple[bytes,bytes],
 )->tuple[bytes,...]:
-    results=[]
+    
+    result=[]
     i=0
 
-    while i<len(sequence):
-        if(i<len(sequence)-1
-           and sequence[i]==pair[0]
-           and sequence[i+1]==pair[1]):
-            results.append(pair[0]+pair[1])
+    while i < len(sequence):
+        if (i<len(sequence)-1 
+            and sequence[i]==pair[0]
+            and sequence[i+1]==pair[1]):
+            result.append(pair[0]+pair[1])
             i+=2
         else:
-            results.append(sequence[i])
+            result.append(sequence[i])
             i+=1
+    return tuple(result)
 
-    return tuple(results)
-
-# 根据输入文段构造BPE
 def train_bpe(
     input_path:str,
     vocab_size:int,
-    special_tokens:list[str]
-)->tuple[dict[int,bytes],list[tuple[bytes,bytes]]]:  # bytes是什么数据类型
-    vocab={  # 对vocab进行初始化
-        i:bytes([i]) 
+    special_tokens:list[str],
+)->tuple[dict[int,bytes],list[tuple[bytes,bytes]]]:
+    
+    # 定义vocab，dict类型
+    vocab={
+        i:bytes([i])
         for i in range(256)
-    }   # 什么时候用{}()
+    }
 
-    merges=[]
-
-    # 加入special_tokens
     for token in special_tokens:
         vocab[len(vocab)]=token.encode("utf-8")
-    
+
     if len(vocab)>vocab_size:
         raise ValueError("vocab_size太小")
     
-    # 读取训练文本
+    # 定义list类型
+    merges=[]
+
+
     with open(input_path,"r",encoding="utf-8") as f:
         text=f.read()
 
-    if special_tokens:  # 如果special_tokens存在，就要把训练文本按照special_tokens切开
+    # 按照special_tokens来划分边界
+    if special_tokens:
         special_pattern="|".join(
-            re.escape(tokens)
-            for tokens in special_tokens
+            re.escape(token)
+            for token in special_tokens
         )
-        parts=re.split(special_pattern,text)
-    else:
-        parts=[text]  # 没有special_tokens，就不需要切分
-    # 对每部分part进行单词计数
-    pretoken_counts=Counter()
 
+        parts=re.split(
+            special_pattern,
+            text
+        )
+    else:
+        parts=[text]
+
+    
+    # 定义pretoken_counts统计单词出现次数
+    pretoken_counts=Counter()
     for part in parts:
         for match in re.finditer(PATTERN,part):
-            token=match.group() # 还原为真实字符串
+            token=match.group()
             pretoken_counts[token]+=1
 
-    # 根据现有的单词个数构造字符数目，拆开单词
+    
+
+    # 定义token_counts将字母中的序列展开统计
+    # dict类型
     token_counts=Counter()
     for token,count in pretoken_counts.items():
         encoded=token.encode("utf-8")
-
+        # tuple类型
         sequence=tuple(
             bytes([byte])
             for byte in encoded
         )
-        token_counts[sequence]+=count  # 例：token_counts[(b"l", b"o", b"w")] = 5
+
+        token_counts[sequence]+=count
+
     
-    # 主循环，进行BPE merge
+    # 定义pair_counts统计相邻字符数量
+    pair_counts=Counter()   # dict类型
+    pair_to_sequences={}   # dict类型
+
+    for sequence,count in token_counts.items():
+        for i in range(len(sequence)-1):
+            # tuple类型
+            pair=(sequence[i],sequence[i+1])
+
+            pair_counts[pair]+=count
+
+            if pair not in pair_to_sequences:
+                pair_to_sequences[pair]=set()
+            
+            pair_to_sequences[pair].add(sequence)
+
+    # merge主循环
     while len(vocab)<vocab_size:
-        pair_counts=Counter()
-
-        # 构造相邻字符数目
-        for sequence,count in token_counts.items():
-            for i in range(len(sequence)-1):
-                pair=(sequence[i],
-                      sequence[i+1])
-                pair_counts[pair]+=count
-
         if not pair_counts:
             break
+
+        # tuple类型
         best_pair=max(
             pair_counts,
-            key=lambda pair: (
+            key=lambda pair:(
                 pair_counts[pair],
                 pair,
             ),
         )
 
+        #补充merges
         merges.append(best_pair)
 
-        best_tokens=best_pair[0]+best_pair[1]
+        best_tokens=(best_pair[0]+best_pair[1])
         vocab[len(vocab)]=best_tokens
 
-        # 更新token_counts
-        new_token_counts=Counter()
 
-        for sequence,count in token_counts.items():
-            new_sequence=merge_sequence(
-                sequence,
-                best_pair
+
+
+
+        # 列表类型
+        affected_sequences=list(
+            pair_to_sequences.get(
+                best_pair,
+                set(),
             )
-            new_token_counts[new_sequence]+=count
-            # 把新的匹配的字符更新到序列里
+        )
 
-        token_counts=new_token_counts
+        # list类型，内部存储tuple
+        affected_info=[
+            (sequence,token_counts[sequence])
+            for sequence in affected_sequences
+        ]
+
+
+
+        for sequence,count in affected_info:
+            # 1.删除token_counts中受影响的序列
+            del token_counts[sequence]
+
+            old_pairs=set()  # 存储受到影响的元组（相邻元素）
+
+            for i in range(len(sequence)-1):
+                pair=(sequence[i],sequence[i+1])
+                old_pairs.add(pair)
+
+                # 2.删除pair_counts中受到影响的sequence中的相邻元组
+                pair_counts[pair]-=count
+
+                if pair_counts[pair]<=0:
+                    del pair_counts[pair]
+
+            # 3.删除pair_to_sequences中pair关于受到影响的sequence索引
+            for pair in old_pairs:
+                if pair in pair_to_sequences:
+                    pair_to_sequences[pair].discard(sequence)
+                
+                if not pair_to_sequences[pair]:
+                    del pair_to_sequences[pair]
+
+        merge_counts=Counter()  # dict类型
+        for sequence,count in affected_info:
+            new_sequence=merge_sequence(sequence,best_pair)
+
+            merge_counts[new_sequence]+=count
+        
+
+        # 更新数据
+        for sequence,count in merge_counts.items():
+            # 1.更新token_counts
+            token_counts[sequence]+=count
+            # 原先的删去了，现在需要加入新的
+
+            new_pairs=set()
+
+            for i in range(len(sequence)-1):
+                pair=(sequence[i],sequence[i+1])
+
+                new_pairs.add(pair)
+
+                # 2.更新pair_counts
+                pair_counts[pair]+=count
+
+            
+            # 3.更新pair_to_sequences
+            for pair in new_pairs:
+                if pair not in pair_to_sequences:
+                    pair_to_sequences[pair]=set()
+                pair_to_sequences[pair].add(sequence)
     return vocab,merges
