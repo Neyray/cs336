@@ -10,7 +10,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics import bpe
-
+from cs336_basics import tokenization
 
 def run_linear(
     d_in: int,
@@ -561,7 +561,10 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+
+
+    return tokenization.Tokenization(vocab=vocab,merges=merges,special_tokens=special_tokens)
+    #raise NotImplementedError
 
 
 def run_train_bpe(
@@ -594,4 +597,4 @@ def run_train_bpe(
 
     return bpe.train_bpe(input_path,vocab_size,special_tokens)
 
-    raise NotImplementedError
+    #raise NotImplementedError

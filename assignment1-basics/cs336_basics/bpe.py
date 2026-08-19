@@ -5,7 +5,7 @@ import os
 
 
 # GPT-2 pre-tokenization regex
-PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""   # str类型，r 的作用主要是让 \ 不被 Python 提前解释
 
 # 根据pair来更新现有序列
 def merge_sequence(
@@ -107,7 +107,7 @@ def train_bpe(
     
     # 定义pair_counts统计相邻字符数量
     pair_counts=Counter()   # Counter类型
-    pair_to_sequences={}   # Counter类型
+    pair_to_sequences={}   # dict类型
 
     for sequence,count in token_counts.items():
         for i in range(len(sequence)-1):
@@ -147,9 +147,11 @@ def train_bpe(
 
         # 列表类型
         affected_sequences=list(
+            # 如果 best_pair 存在 → 返回对应的 value
+            # 如果不存在 → 返回第二个参数，也就是 set()
             pair_to_sequences.get(
                 best_pair,
-                set(),
+                set(),   # set()表示创建空集合
             )
         )
 
