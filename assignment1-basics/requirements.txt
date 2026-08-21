@@ -1,0 +1,8 @@
+torch
+numpy
+regex
+pytest
+jaxtyping
+tiktoken
+tqdm
+psutil

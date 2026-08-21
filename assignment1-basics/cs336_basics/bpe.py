@@ -98,7 +98,7 @@ def train_bpe(
         encoded=token.encode("utf-8")
         # tuple类型
         sequence=tuple(
-            bytes([byte])
+            bytes([byte])   # 把这个整数重新包装成一个单字节的 bytes 对象
             for byte in encoded
         )
 
@@ -217,3 +217,6 @@ def train_bpe(
                     pair_to_sequences[pair]=set()
                 pair_to_sequences[pair].add(sequence)
     return vocab,merges
+
+
+# 遍历encoded=token.encode("utf-8")得到数字，encoded=b'hello'
