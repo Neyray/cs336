@@ -46,6 +46,9 @@ class Linear(nn.Module):
             b=3 * sigma,
         )
         #  直接写linear=Linear(4,3)初始化类，再y=linear(x)直接调用forward，通过nn.Module
+
+
+    # nn.Module规定，调用对象本身执行forward函数，例，linear=Linear(...),linear.(x)就会调用linear.forward(x)函数
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.weight.T
     
@@ -121,3 +124,32 @@ class RMSNorm(nn.Module):
         x = x * self.weight
 
         return x.to(input_dtype)
+    
+
+
+class SwiGLU(nn.Module):
+    def __init__(
+        self,
+        d_model:int,
+        d_ff:int,
+    ):
+        super().__init__()
+
+        self.d_model=d_model
+        self.d_ff=d_ff
+
+        self.w1=Linear(d_model,d_ff)
+        self.w2=Linear(d_ff,d_model)
+        self.w3=Linear(d_model,d_ff)
+
+    
+    def forward(self,x:torch.Tensor)->torch.Tensor:
+        gate=self.w1(x)
+        value=self.w3(x)
+
+        x=nn.functional.silu(gate)# silu部分
+        x=x*value# glu部分
+
+        x=self.w2(x)
+        
+        return x
