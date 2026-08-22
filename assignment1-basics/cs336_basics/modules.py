@@ -80,3 +80,44 @@ class Embedding(nn.Module):
         )
     def forward(self,token_ids:torch.Tensor)->torch.Tensor:
         return self.weight[token_ids]
+
+
+
+class RMSNorm(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        eps: float = 1e-5,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+
+        self.d_model = d_model
+        self.eps = eps
+
+        self.weight = nn.Parameter(
+            # torch.ones()表示矩阵初始化为1，torch.empty()则为垃圾值
+            torch.ones(
+                # 这不叫矩阵，torch.Tensor([1,2,3])，刚好和每个token的序列对上，shape(d_model,)
+                d_model,
+                device=device,
+                dtype=dtype,
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+
+        x = x.to(torch.float32)
+
+        rms = torch.sqrt(
+            torch.mean(x ** 2, dim=-1, keepdim=True)  # dim=-1表示对最后一个维度进行计算,keepdim=True表示保持结构的不变
+            + self.eps
+        )
+
+        x = x / rms
+
+        x = x * self.weight
+
+        return x.to(input_dtype)

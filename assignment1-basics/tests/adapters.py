@@ -13,6 +13,7 @@ from cs336_basics import bpe
 from cs336_basics import tokenization
 from cs336_basics.modules import Linear
 from cs336_basics.modules import Embedding
+from cs336_basics.modules import RMSNorm
 
 def run_linear(
     d_in: int,
@@ -41,6 +42,7 @@ def run_linear(
         dtype=weights.dtype,
     )
 
+    # 将参数更新到权重
     linear.load_state_dict(
         {
             # self.weight对应"weight"
@@ -406,7 +408,16 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+
+    rms_norm=RMSNorm(d_model=d_model,eps=eps,device=weights.device,dtype=weights.dtype)
+
+
+    # 必须将输入的weights存入新建的对象，不然权重仍是初始化的[1,1,...]
+    rms_norm.load_state_dict({
+        "weight":weights
+    })
+
+    return rms_norm.forward(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
