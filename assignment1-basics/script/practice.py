@@ -1,49 +1,40 @@
 import torch
-from torch import nn
+import math
 
-class RoPE(nn.Module):
-    def __init__(
-        self,
-        theta:int,
-        d_k:int,
-        max_seq_len:int,
-        device:torch.device | None=None,
-    ):
-        positions=torch.arrange(max_seq_len,device=device)
+def softmax(
+    x:torch.Tensor,
+    dim:int
+)->torch.Tensor:
+    x_max=torch.max(x,dim=dim,keepdim=True).values
+    x_shift=x-x_max
 
-        freqs=1.0/(
-            theta**(torch.arrange(0,d_k,2,device=device)/d_k).float()
-        )
+    return torch.exp(x_shift)/torch.sum(torch.exp(x_shift),dim=dim,keepdim=True)
 
-        angles=torch.outer(positions,freqs)
+def scaled_dot_attention_product(
+    query:torch.Tensor,
+    key:torch.Tensor,
+    value:torch.Tensor,
+    mask:torch.Tensor | None = None
+)-> torch.Tensor:
+    # 取 query 最后一维的大小
+    d_k=query.shape[-1]
 
-        self.register_buffer(
-            "cos",
-            torch.cos(angles)
-        )
+    scores=torch.einsum(
+        "...q d,...k d -> ...q k",
+        query,
+        key,
+    )
 
-        self.register_buffer(
-            "sin",
-            torch.sin(angles)
-        )
+    scores=scores/torch.sqrt(d_k)
 
-    def forward(
-        self,
-        token_position:torch.Tensor,
-        x:torch.Tensor
-    )->torch.Tensor:
-        
-        cos=self.cos[token_position]
-        sin=self.sin[token_position]
+    if mask is not None:
+        scores=torch.masked_fill(scores,~mask,float("-inf"))
 
-        x_even=x[...,::2]
-        x_odd=x[...,1::2]
+    attn=softmax(scores,dim=-1)# 对最后一维计算出来的分数进行归一化处理
 
-        rotated_even=(x_even*cos-x_odd*sin)
-        rotated_odd=(x_even*sin+x_odd*cos)
-
-        rotated=torch.stack(
-            [x_even,x_odd],
-            dim=-1
-        )
-        return rotated.flatten(-2)
+    output=torch.einsum(
+        "...q k,...k d -> ...q d",
+        attn,
+        value,
+    )
+    return output
