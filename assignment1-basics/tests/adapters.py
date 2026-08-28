@@ -18,6 +18,7 @@ from cs336_basics.modules import SwiGLU
 from cs336_basics.modules import RotaryPositionalEmbedding
 from cs336_basics.modules import softmax
 from cs336_basics.modules import scaled_dot_product_attention
+from cs336_basics.modules import MultiHeadSelfAttention
 
 def run_linear(
     d_in: int,
@@ -180,7 +181,17 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mha=MultiHeadSelfAttention(d_model,num_heads)
+
+    qkv_proj_weight=torch.cat(
+        [q_proj_weight,k_proj_weight,v_proj_weight],
+        dim=0,
+    )
+    with torch.no_grad():
+        mha.qkv_proj.weight.copy_(qkv_proj_weight)
+        mha.output_proj.weight.copy_(o_proj_weight)
+
+    return mha(in_features)
 
 
 def run_multihead_self_attention_with_rope(

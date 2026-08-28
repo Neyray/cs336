@@ -2,7 +2,7 @@ import math
 
 import torch
 from torch import nn
-
+from einops import rearrange
 
 # nn.Module是PyTorch 所有“神经网络层”的基础类，继承它之后，PyTorch 才能自动管理参数
 class Linear(nn.Module):
@@ -283,3 +283,93 @@ def scaled_dot_product_attention(
     )
 
     return output
+
+
+
+
+# 多头注意力
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+    ):
+        super().__init__()
+
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+
+        # 一次性生成 Q, K, V
+        # 输入:  (..., d_model)
+        # 输出:  (..., 3 * d_model)
+        self.qkv_proj = Linear(d_model, 3 * d_model)
+
+        # 多头拼接后再映射回 d_model
+        self.output_proj = Linear(d_model, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        x: (batch_size, seq_len, d_model)
+
+        return:
+            (batch_size, seq_len, d_model)
+        """
+
+        T=x.shape[-2]
+
+        # qkv: (B, T, 3 * d_model)
+        qkv = self.qkv_proj(x)
+
+        # q, k, v: each (B, T, d_model)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # 拆成多头
+        # (B, T, d_model)
+        # -> (B, num_heads, T, d_head)
+        q = rearrange(
+            q,
+            "b t (h d) -> b h t d",
+            h=self.num_heads,
+        )
+        k = rearrange(
+            k,
+            "b t (h d) -> b h t d",
+            h=self.num_heads,
+        )
+        v = rearrange(
+            v,
+            "b t (h d) -> b h t d",
+            h=self.num_heads,
+        )
+
+        # causal multi-head attention
+        # 输出: (B, num_heads, T, d_head)
+        casual_mask=torch.tril(
+            torch.ones(T,T,device=x.device,dtype=torch.bool)
+        )
+        attn_output = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            mask=casual_mask,
+        )
+
+        # 多头拼回去
+        # (B, num_heads, T, d_head)
+        # -> (B, T, d_model)
+        attn_output = rearrange(
+            attn_output,
+            "b h t d -> b t (h d)",
+        )
+
+        # 输出投影
+        output = self.output_proj(attn_output)
+
+        return output
