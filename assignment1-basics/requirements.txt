@@ -1,8 +1,30 @@
-torch
-numpy
-regex
-pytest
-jaxtyping
-tiktoken
-tqdm
-psutil
+# CS336 Spring 2026 - Assignment 1: Basics
+# Python: >=3.12,<3.14
+
+# Core tensor / numerical computing
+torch~=2.11.0
+numpy>=2.4
+einops>=0.8
+einx>=0.4
+
+# Type annotations
+jaxtyping>=0.3
+
+# Tokenizer / text processing
+regex>=2026.3.32
+tiktoken>=0.12.0
+
+# Testing
+pytest>=9.0
+pytest-timeout
+
+# Utilities
+psutil>=7
+tqdm>=4.67
+
+# Experiment tracking
+wandb>=0.25
+
+# Development / linting
+ty>=0.0.26
+ruff>=0.15.8

@@ -1,84 +1,35 @@
 import torch
-from torch import nn
-from jaxtyping import Float, Int
 from torch import Tensor
 
 
-class TransformerLM(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        context_length: int,
-        d_model: int,
-        num_layers: int,
-        num_heads: int,
-        d_ff: int,
-        rope_theta: float,
-        device=None,
-        dtype=None,
-    ):
-        super().__init__()
+def cross_entropy(
+    inputs: Tensor,
+    targets: Tensor,
+) -> Tensor:
+    """
+    inputs:  (..., vocab_size)
+    targets: (...)
 
-        # 1. token ID -> d_model 向量
-        self.token_embeddings = Embedding(
-            num_embeddings=vocab_size,
-            embedding_dim=d_model,
-            device=device,
-            dtype=dtype,
-        )
+    return:
+        scalar loss
+    """
 
-        # 2. 堆叠 num_layers 个 Transformer Block
-        self.layers = nn.ModuleList(
-            [
-                TransformerBlock(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    d_ff=d_ff,
-                    max_seq_len=context_length,
-                    theta=rope_theta,
-                    device=device,
-                    dtype=dtype,
-                )
-                for _ in range(num_layers)
-            ]
-        )
+    # 1. 数值稳定性：每组 logits 减去自己的最大值
+    shifted_inputs = inputs - inputs.max(dim=-1, keepdim=True).values
 
-        # 3. 所有 Transformer Block 之后再做一次 RMSNorm
-        self.ln_final = RMSNorm(
-            d_model=d_model,
-            device=device,
-            dtype=dtype,
-        )
+    # 2. log(sum(exp(logits)))
+    log_sum_exp = torch.log(
+        torch.exp(shifted_inputs).sum(dim=-1)
+    )
 
-        # 4. d_model -> vocab_size
-        self.lm_head = Linear(
-            in_features=d_model,
-            out_features=vocab_size,
-            device=device,
-            dtype=dtype,
-        )
+    # 3. 取出正确 token 对应的 logit
+    target_logits = shifted_inputs.gather(
+        dim=-1,
+        index=targets.unsqueeze(-1),
+    ).squeeze(-1)
 
-    def forward(
-        self,
-        in_indices: Int[Tensor, "batch_size sequence_length"],
-    ) -> Float[Tensor, "batch_size sequence_length vocab_size"]:
+    # 4. CE = log(sum(exp(logits))) - 正确 token 的 logit
+    loss = log_sum_exp - target_logits
 
-        # (B,T)
-        #     ↓ Embedding
-        # (B,T,d_model)
-        x = self.token_embeddings(in_indices)
-
-        # 每一层都保持：
-        # (B,T,d_model) -> (B,T,d_model)
-        for layer in self.layers:
-            x = layer(x)
-
-        # (B,T,d_model)
-        x = self.ln_final(x)
-
-        # (B,T,d_model)
-        #       ↓
-        # (B,T,vocab_size)
-        logits = self.lm_head(x)
-
-        return logits
+    # 对所有 batch-like 维度平均
+    return loss.mean()
