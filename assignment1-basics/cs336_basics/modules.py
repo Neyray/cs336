@@ -367,7 +367,7 @@ class MultiHeadSelfAttention(nn.Module):
             if token_positions is not None:
                 token_positions.unsqueeze(-2)
             else:
-                token_positions=torch.arrange(
+                token_positions=torch.arange(
                     T,
                     device=x.device,
                 )
@@ -398,3 +398,42 @@ class MultiHeadSelfAttention(nn.Module):
         output = self.output_proj(attn_output)
 
         return output
+    
+# Transformer Block
+class Transformer_Block(nn.Module):
+    def __init__(
+        self,
+        d_model:int,
+        num_heads:int,
+        theta:int,
+        d_ff:int,
+        max_seq_len:int,
+    ):
+        super().__init__()
+        self.ln1=RMSNorm(
+            d_model=d_model,
+        )
+
+        self.attn=MultiHeadSelfAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            theta=theta,
+            max_seq_len=max_seq_len,
+        )
+        self.ln2=RMSNorm(
+            d_model=d_model,
+        )
+
+        self.ffn=SwiGLU(
+            d_model=d_model,
+            d_ff=d_ff,
+        )
+
+    
+    def forward(
+        self,
+        x:torch.Tensor,
+    ):
+        x=x+self.attn(self.ln1(x))
+        x=x+self.ffn(self.ln2(x))
+        return x
