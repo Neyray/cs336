@@ -3,6 +3,8 @@ import math
 import torch
 from torch import nn
 from einops import rearrange
+from jaxtyping import Float, Int
+from torch import Tensor
 
 # nn.Module是PyTorch 所有“神经网络层”的基础类，继承它之后，PyTorch 才能自动管理参数
 class Linear(nn.Module):
@@ -398,7 +400,9 @@ class MultiHeadSelfAttention(nn.Module):
         output = self.output_proj(attn_output)
 
         return output
-    
+
+
+
 # Transformer Block
 class Transformer_Block(nn.Module):
     def __init__(
@@ -437,3 +441,72 @@ class Transformer_Block(nn.Module):
         x=x+self.attn(self.ln1(x))
         x=x+self.ffn(self.ln2(x))
         return x
+    
+
+
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size:int,
+        context_length:int,
+        d_model:int,
+        num_layers:int,
+        num_heads:int,
+        d_ff:int,
+        rope_theta:float,
+        device=None,
+        dtype=None,
+    ):
+        
+        super().__init__()
+        #1.将token_ids转化为向量
+        self.token_embeddings=Embedding(
+            num_embeddings=vocab_size,
+            embedding_dims=d_model,
+            device=device,
+            dtype=dtype,
+        )
+        #2.Transformer Block
+        self.layers=nn.ModuleList(
+            [
+                Transformer_Block(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    theta=rope_theta,
+                    d_ff=d_ff,
+                    max_seq_len=context_length,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        #3.最外层RMSNorm
+        self.ln_final=RMSNorm(
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+        #4.转为vocab_size维
+        self.lm_head=Linear(
+            in_features=d_model,
+            out_features=vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+
+
+
+    def forward(
+        self,
+        in_indices:Int[Tensor,"batch_size sequence_length"],
+    )->Float[Tensor,"batch_size sequence_length"]:
+        x=self.token_embeddings(in_indices)
+
+        for layer in self.layers:
+            x=layer(x)
+        x=self.ln_final(x)
+
+        logits=self.lm_head(x)
+
+        return logits

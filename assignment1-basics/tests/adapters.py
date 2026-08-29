@@ -20,6 +20,7 @@ from cs336_basics.modules import softmax
 from cs336_basics.modules import scaled_dot_product_attention
 from cs336_basics.modules import MultiHeadSelfAttention
 from cs336_basics.modules import Transformer_Block
+from cs336_basics.modules import TransformerLM
 
 def run_linear(
     d_in: int,
@@ -452,7 +453,44 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    model=TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+    )
+
+    new_weights={
+        "token_embeddings.weight":weights["token_embeddings.weight"],
+        "ln_final.weight":weights["ln_final.weight"],
+        "lm_head.weight":weights["lm_head.weight"],
+    }
+
+    for i in range(num_layers):
+        qkv_proj=torch.cat(
+            [
+                weights[f"layers.{i}.attn.q_proj.weight"],
+                weights[f"layers.{i}.attn.k_proj.weight"],
+                weights[f"layers.{i}.attn.v_proj.weight"],
+            ],
+            dim=0,
+        )
+        new_weights[f"layers.{i}.attn.qkv_proj.weight"]=qkv_proj
+        new_weights[f"layers.{i}.attn.output_proj.weight"]=(weights[f"layers.{i}.attn.output_proj.weight"])
+        new_weights[f"layers.{i}.ln1.weight"]=(weights[f"layers.{i}.ln1.weight"])
+        new_weights[f"layers.{i}.ln2.weight"]=(weights[f"layers.{i}.ln2.weight"])
+        new_weights[f"layers.{i}.ffn.w1.weight"]=(weights[f"layers.{i}.ffn.w1.weight"])
+        new_weights[f"layers.{i}.ffn.w2.weight"]=(weights[f"layers.{i}.ffn.w2.weight"])
+        new_weights[f"layers.{i}.ffn.w3.weight"]=(weights[f"layers.{i}.ffn.w3.weight"])
+
+    model.load_state_dict(
+        new_weights,
+        strict=False,
+    )
+    return model(in_indices)
 
 
 def run_rmsnorm(
