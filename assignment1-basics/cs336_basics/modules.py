@@ -293,6 +293,8 @@ class MultiHeadSelfAttention(nn.Module):
         self,
         d_model: int,
         num_heads: int,
+        theta:float | None=None,
+        max_seq_len:int | None=None,
     ):
         super().__init__()
 
@@ -309,6 +311,16 @@ class MultiHeadSelfAttention(nn.Module):
 
         # 多头拼接后再映射回 d_model
         self.output_proj = Linear(d_model, d_model)
+
+
+        if theta is not None and max_seq_len is not None:
+            self.rope=RotaryPositionalEmbedding(
+                theta=theta,
+                d_k=self.d_head,
+                max_seq_len=max_seq_len,
+            )
+        else:
+            self.rope=None
 
     def forward(
         self,
@@ -349,16 +361,29 @@ class MultiHeadSelfAttention(nn.Module):
             h=self.num_heads,
         )
 
+        
+
+        if self.rope is not None:
+            if token_positions is not None:
+                token_positions.unsqueeze(-2)
+            else:
+                token_positions=torch.arrange(
+                    T,
+                    device=x.device,
+                )
+            q=self.rope(q,token_positions)
+            k=self.rope(k,token_positions)
+        
         # causal multi-head attention
         # 输出: (B, num_heads, T, d_head)
-        casual_mask=torch.tril(
+        causal_mask=torch.tril(
             torch.ones(T,T,device=x.device,dtype=torch.bool)
         )
         attn_output = scaled_dot_product_attention(
             q,
             k,
             v,
-            mask=casual_mask,
+            mask=causal_mask,
         )
 
         # 多头拼回去
