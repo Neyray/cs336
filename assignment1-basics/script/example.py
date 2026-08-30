@@ -1,39 +1,43 @@
 import math
+from collections.abc import Iterable
+
+import torch
 
 
-def get_lr_cosine_schedule(
-    t: int,
-    alpha_max: float,
-    alpha_min: float,
-    T_w: int,
-    T_c: int,
-) -> float:
+def gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter],
+    max_l2_norm: float,
+) -> None:
     """
-    Linear warmup + cosine learning rate schedule.
+    Clip the global L2 norm of all parameter gradients.
 
-    Args:
-        t: 当前训练 step
-        alpha_max: 最大学习率
-        alpha_min: 最小学习率
-        T_w: warmup 结束的 step
-        T_c: cosine decay 结束的 step
-
-    Returns:
-        当前 step 对应的 learning rate
+    The gradients are modified in-place.
     """
 
-    # 1. Warmup：学习率从 0 线性增加到 alpha_max
-    if t < T_w:
-        return (t / T_w) * alpha_max
+    # parameters 可能是 model.parameters() 这样的迭代器，
+    # 后面需要遍历多次，所以先转成 list。
+    parameters = [
+        p for p in parameters
+        if p.grad is not None
+    ]
 
-    # 2. Cosine decay：从 alpha_max 平滑下降到 alpha_min
-    elif t <= T_c:
-        progress = (t - T_w) / (T_c - T_w)
+    if len(parameters) == 0:
+        return
 
-        return alpha_min + 0.5 * (
-            1 + math.cos(math.pi * progress)
-        ) * (alpha_max - alpha_min)
+    # 1. 计算所有参数梯度合起来的全局 L2 norm
+    total_norm_squared = 0.0
 
-    # 3. T_c 之后保持最小学习率
-    else:
-        return alpha_min
+    for p in parameters:
+        grad_norm = p.grad.norm(2).item()
+        total_norm_squared += grad_norm ** 2
+
+    total_norm = math.sqrt(total_norm_squared)
+
+    # 2. 计算裁剪比例
+    eps = 1e-6
+    clip_coef = max_l2_norm / (total_norm + eps)
+
+    # 3. norm 太大时，所有梯度乘同一个系数
+    if clip_coef < 1.0:
+        for p in parameters:
+            p.grad.mul_(clip_coef)

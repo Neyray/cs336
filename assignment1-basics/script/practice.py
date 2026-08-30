@@ -1,21 +1,31 @@
 import math
 
+from collections.abc import Iterable
 import torch
 
-def get_lr_cosine_schedule(
-    t:int,
-    alpha_max:float,
-    alpha_min:float,
-    T_w:int,
-    T_c:int,
-)->float:
-    if t<T_w:
-        return t/T_w * alpha_max
-    
-    elif T_w<=t<=T_c:
-        progress=(t-T_w)/(T_c-T_w)
+def gradient_clipping(
+    parameters:Iterable[torch.nn.Parameter],
+    max_l2_norm:float,
+)->None:
+    parameters=[
+        p
+        for p in parameters
+        if p.grad is not None
+    ]
 
-        return alpha_min+0.5*(1+math.cos(math.pi*progress))*(alpha_max-alpha_min)
+    if len(parameters)==0:
+        return
     
-    else:
-        return alpha_min
+    total_norm_squared=0.0
+    for p in parameters:
+        grad_norm=p.grad.norm(2).items
+        total_norm_squared+=grad_norm**2
+
+    total_norm=math.sqrt(total_norm_squared)
+
+    eps=1e-6
+    clip_coef=max_l2_norm/(total_norm+eps)
+
+    if clip_coef<1.0:
+        for p in parameters:
+            p.grad.mul_(clip_coef)
