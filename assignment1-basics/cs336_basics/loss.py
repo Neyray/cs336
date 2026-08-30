@@ -25,7 +25,7 @@ def cross_entropy(
     # 3. 取出正确 token 对应的 logit
     target_logits = shifted_inputs.gather(
         dim=-1,
-        index=targets.unsqueeze(-1),
+        index=targets.unsqueeze(-1),  # unsqueeze(-1)表示增加最后一维
     ).squeeze(-1)
 
     # 4. CE = log(sum(exp(logits))) - 正确 token 的 logit
