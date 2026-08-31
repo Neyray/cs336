@@ -20,7 +20,7 @@ class AdamW(torch.optim.Optimizer):
 
         super().__init__(params, defaults)
 
-    # 只负责该参数，不记录梯度，不成为计算图的一部分被autograd追踪
+    # 只负责改参数，不记录梯度，不成为计算图的一部分被autograd追踪
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
