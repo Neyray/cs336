@@ -1,43 +1,51 @@
-import math
-from collections.abc import Iterable
-
+import numpy as np
+import numpy.typing as npt
 import torch
 
 
-def gradient_clipping(
-    parameters: Iterable[torch.nn.Parameter],
-    max_l2_norm: float,
-) -> None:
+def get_batch(
+    # dataset是numpy类型
+    dataset: npt.NDArray,
+    batch_size: int,
+    context_length: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Clip the global L2 norm of all parameter gradients.
+    从一维 token ID 数组中随机采样一个 batch。
 
-    The gradients are modified in-place.
+    x: 输入 token
+    y: x 中每个 token 对应的下一个 token
+    x.shape(B,T)
+    y.shape(B,T)
     """
 
-    # parameters 可能是 model.parameters() 这样的迭代器，
-    # 后面需要遍历多次，所以先转成 list。
-    parameters = [
-        p for p in parameters
-        if p.grad is not None
-    ]
+    # 1. 随机选择 batch_size 个起始位置
+    starting_indices = torch.randint(
+        low=0,
+        high=len(dataset) - context_length,
+        size=(batch_size,),
+    )
 
-    if len(parameters) == 0:
-        return
+    # 2. 根据每个起始位置截取 context_length 个 token，作为输入
+    x = torch.stack([
+        # from_numpy把numpy类型转换成torch.Tensor
+        torch.from_numpy(
+            # astype是为了返回整数索引
+            dataset[i : i + context_length].astype(np.int64)
+        )
+        for i in starting_indices
+    ])
 
-    # 1. 计算所有参数梯度合起来的全局 L2 norm
-    total_norm_squared = 0.0
+    # 3. 整体向右移动一个 token，作为预测目标
+    y = torch.stack([
+        torch.from_numpy(
+            dataset[i + 1 : i + context_length + 1].astype(np.int64)
+        )
+        for i in starting_indices
+    ])
 
-    for p in parameters:
-        grad_norm = p.grad.norm(2).item()
-        total_norm_squared += grad_norm ** 2
+    # 4. 移动到指定设备
+    x = x.to(device)
+    y = y.to(device)
 
-    total_norm = math.sqrt(total_norm_squared)
-
-    # 2. 计算裁剪比例
-    eps = 1e-6
-    clip_coef = max_l2_norm / (total_norm + eps)
-
-    # 3. norm 太大时，所有梯度乘同一个系数
-    if clip_coef < 1.0:
-        for p in parameters:
-            p.grad.mul_(clip_coef)
+    return x, y

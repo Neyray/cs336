@@ -1,31 +1,35 @@
-import math
-
-from collections.abc import Iterable
+import numpy as np
+import numpy.typing as npt
 import torch
 
-def gradient_clipping(
-    parameters:Iterable[torch.nn.Parameter],
-    max_l2_norm:float,
-)->None:
-    parameters=[
-        p
-        for p in parameters
-        if p.grad is not None
-    ]
-
-    if len(parameters)==0:
-        return
+def get_batch(
+    dataset:npt.NDArray,
+    batch_size:int,
+    context_length:int,
+    device=None,
+)->tuple[torch.Tensor,torch.Tensor]:
     
-    total_norm_squared=0.0
-    for p in parameters:
-        grad_norm=p.grad.norm(2).items
-        total_norm_squared+=grad_norm**2
+    start_indices=torch.randint(
+        low=0,
+        high=len(dataset)-context_length,
+        size=batch_size,
+    )
 
-    total_norm=math.sqrt(total_norm_squared)
+    x=torch.stack([
+        torch.from_numpy(
+            dataset[i:i+context_length].astype(np.int64)
+            for i in start_indices
+        )
+    ])
 
-    eps=1e-6
-    clip_coef=max_l2_norm/(total_norm+eps)
+    y=torch.stack([
+        torch.from_numpy(
+            dataset[i+1:i+context_length+1].astype(np.int64)
+            for i in start_indices
+        )
+    ])
 
-    if clip_coef<1.0:
-        for p in parameters:
-            p.grad.mul_(clip_coef)
+    inputs=x.to(device)
+    targets=y.to(device)
+
+    return inputs,targets 
