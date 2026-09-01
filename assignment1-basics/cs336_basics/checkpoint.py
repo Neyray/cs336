@@ -11,7 +11,7 @@ def save_checkpoint(
     out: str | os.PathLike | BinaryIO | IO[bytes],
 ) -> None:
     checkpoint = {
-        # state_dict()：把一个对象当前需要保存的“状态”整理成一个字典
+        # state_dict()：把一个对象当前需要保存的“状态”整理成一个字典，所有Parameter+buffer
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "iteration": iteration,
