@@ -161,11 +161,11 @@ def train(args: argparse.Namespace) -> None:
         # -----------------------------------------------------
 
         lr = get_lr_cosine_schedule(
-            it=iteration,
-            max_learning_rate=args.max_lr,
-            min_learning_rate=args.min_lr,
-            warmup_iters=args.warmup_iters,
-            cosine_cycle_iters=args.cosine_cycle_iters,
+            t=iteration,
+            alpha_max=args.max_lr,
+            alpha_min=args.min_lr,
+            T_w=args.warmup_iters,
+            T_c=args.cosine_cycle_iters,
         )
 
         # optimizer 里面的 lr 要更新
