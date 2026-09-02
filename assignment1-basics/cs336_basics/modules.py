@@ -460,6 +460,8 @@ class TransformerLM(nn.Module):
     ):
         
         super().__init__()
+        # 记录最大上下文长度，生成时用于裁剪超长序列（RoPE cache 只到 context_length）
+        self.context_length=context_length
         #1.将token_ids转化为向量
         self.token_embeddings=Embedding(
             num_embeddings=vocab_size,

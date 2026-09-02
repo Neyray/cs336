@@ -37,6 +37,14 @@ class Tokenization:
             for rank,pair in enumerate(self.merges)
         }
 
+        # 记录 <|endoftext|> 的 id，供生成时判断停止
+        self.eos_id=None
+        for candidate in ("<|endoftext|>", *self.special_tokens):
+            candidate_bytes=candidate.encode("utf-8")
+            if candidate_bytes in self.token_to_id:
+                self.eos_id=self.token_to_id[candidate_bytes]
+                break
+
         sorted_special_tokens=sorted(
             set(self.special_tokens),
             key=len,
