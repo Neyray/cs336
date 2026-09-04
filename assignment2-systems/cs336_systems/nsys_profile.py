@@ -135,6 +135,7 @@ def profile_step(
         # ------------------
         # Forward
         # ------------------
+        # nvtx.range 本质上就是进入作用域时 push range，退出时 pop range
         with nvtx.range("forward"):
             start = timeit.default_timer()
 

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from cs336_basics.model import BasicsTransformerLM
+from contextlib import nullcontext
 
 
 MODEL_CONFIGS = {
@@ -27,10 +28,16 @@ MODEL_CONFIGS = {
         "d_ff": 5120,
     },
     "xl": {
-        "d_model": 1600,
-        "num_layers": 48,
-        "num_heads": 25,
-        "d_ff": 6400,
+        "d_model": 2560,
+        "num_layers": 32,
+        "num_heads": 32,
+        "d_ff": 10240,
+    },
+    "10B": {
+        "d_model": 4608,
+        "num_layers": 50,
+        "num_heads": 36,
+        "d_ff": 12288,
     },
 }
 
@@ -43,11 +50,12 @@ def synchronize(device: torch.device) -> None:
 def benchmark(
     model_size: str,
     batch_size: int = 4,
-    context_length: int = 128,
+    context_length: int = 512,
     vocab_size: int = 10000,
     warmup_steps: int = 5,
     measurement_steps: int = 10,
     mode: str = "forward",
+    precision: str = "fp32",
     lr: float = 1e-3,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,6 +65,32 @@ def benchmark(
     print(f"device = {device}")
     print(f"model = {model_size}")
     print(config)
+
+
+    def autocast_context():
+        """
+        FP32:
+            do nothing
+
+        BF16:
+            automatically use BF16 for operations such as
+            Linear / matrix multiplication when appropriate.
+        """
+
+        if precision=="bf16":
+            if device.type!="cuda":
+                raise RuntimeError("BF16 benchmark should be run on CUDA.")
+            
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError("Current GPU does not support BF16.")
+            
+            # 进入这个代码区域以后，PyTorch 自动判断每个运算到底应该使用 BF16 还是 FP32
+            return torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+            )
+        return nullcontext()
+    
 
     model = BasicsTransformerLM(
         vocab_size=vocab_size,
@@ -94,21 +128,30 @@ def benchmark(
     def run_step():
         optimizer.zero_grad(set_to_none=True)
 
-        logits = model(x)
+        
+        # ----------------------------------------------------
+        # Mixed precision only wraps:
+        #
+        # forward
+        # +
+        # loss
+        #
+        # backward 放在 autocast 外
+        # ----------------------------------------------------
+        with autocast_context():
+            logits=model(x)
 
-        if mode == "forward":
-            return
+            if mode=="forward":return
 
-        loss = loss_fn(
-            # logits.reshape(B * T, vocab_size)
-            logits.reshape(-1, vocab_size),
-            y.reshape(-1),
-        )
-
+            loss=loss_fn(
+                logits.reshape(-1,vocab_size),
+                y.reshape(-1)
+            )
         loss.backward()
 
-        if mode == "train":
-            optimizer.step()
+        if mode=="train":optimizer.step()   
+
+
 
     # -------------------------
     # Warm-up
@@ -119,6 +162,8 @@ def benchmark(
     for _ in range(warmup_steps):
         run_step()
         synchronize(device)
+
+
 
     # -------------------------
     # Measurement
@@ -171,6 +216,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["fp32","bf16"],
+        default="fp32",
+    )
+    parser.add_argument(
         "--mode",
         choices=["forward", "forward_backward", "train"],
         default="forward",
@@ -193,4 +244,5 @@ if __name__ == "__main__":
         warmup_steps=args.warmup_steps,
         measurement_steps=args.measurement_steps,
         mode=args.mode,
+        precision=args.precision,
     )

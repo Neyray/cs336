@@ -1,17 +1,17 @@
 import argparse
-import math
 import timeit
+from contextlib import nullcontext
 
+import numpy as np
 import torch
-import torch.nn.functional as F
-import torch.cuda.nvtx as nvtx
-from einops import einsum
 
-import cs336_basics.model as model_module
 from cs336_basics.model import BasicsTransformerLM
-from cs336_basics.nn_utils import softmax
-from cs336_basics.optimizer import AdamW
 
+
+# ============================================================
+# Model configurations
+# CS336 Assignment 2 - 2026 Table 1
+# ============================================================
 
 MODEL_CONFIGS = {
     "small": {
@@ -32,164 +32,352 @@ MODEL_CONFIGS = {
         "num_heads": 20,
         "d_ff": 5120,
     },
+    "xl": {
+        "d_model": 2560,
+        "num_layers": 32,
+        "num_heads": 32,
+        "d_ff": 10240,
+    },
+    "10B": {
+        "d_model": 4608,
+        "num_layers": 50,
+        "num_heads": 36,
+        "d_ff": 12288,
+    },
 }
 
 
-# ---------------------------------------------------------
-# 给 Attention 内部操作加 NVTX 标签
-# ---------------------------------------------------------
+# ============================================================
+# CUDA synchronization
+# ============================================================
 
-def annotated_scaled_dot_product_attention(
-    Q: torch.Tensor,
-    K: torch.Tensor,
-    V: torch.Tensor,
-    mask: torch.Tensor | None = None,
-) -> torch.Tensor:
+def synchronize(device: torch.device) -> None:
+    """
+    CUDA operations are asynchronous.
 
-    d_k = K.shape[-1]
-
-    with nvtx.range("attention/scores"):
-        attention_scores = (
-            einsum(
-                Q,
-                K,
-                "... query d_k, ... key d_k -> ... query key",
-            )
-            / math.sqrt(d_k)
-        )
-
-    if mask is not None:
-        with nvtx.range("attention/mask"):
-            attention_scores = torch.where(
-                mask,
-                attention_scores,
-                float("-inf"),
-            )
-
-    with nvtx.range("attention/softmax"):
-        attention_weights = softmax(
-            attention_scores,
-            dim=-1,
-        )
-
-    with nvtx.range("attention/value"):
-        output = einsum(
-            attention_weights,
-            V,
-            "... query key, ... key d_v -> ... query d_v",
-        )
-
-    return output
+    Before measuring time, synchronize CPU and GPU so that the
+    measured time actually contains the GPU computation.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
-# ---------------------------------------------------------
-# 普通 step：专门用于 warm-up
-# ---------------------------------------------------------
+# ============================================================
+# Benchmark
+# ============================================================
 
-def warmup_step(
-    model,
-    optimizer,
-    x,
-    y,
-    vocab_size,
-    mode,
+def benchmark(
+    model_size: str,
+    batch_size: int = 4,
+    context_length: int = 512,
+    vocab_size: int = 10000,
+    warmup_steps: int = 5,
+    measurement_steps: int = 10,
+    mode: str = "forward",
+    precision: str = "fp32",
+    lr: float = 1e-3,
 ):
+    # --------------------------------------------------------
+    # Device
+    # --------------------------------------------------------
 
-    optimizer.zero_grad(set_to_none=True)
-
-    logits = model(x)
-
-    if mode == "forward":
-        return
-
-    loss = F.cross_entropy(
-        logits.reshape(-1, vocab_size),
-        y.reshape(-1),
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
     )
 
-    loss.backward()
+    config = MODEL_CONFIGS[model_size]
 
-    if mode == "train":
-        optimizer.step()
+    print("================================")
+    print(f"device            = {device}")
+    print(f"model             = {model_size}")
+    print(f"precision         = {precision}")
+    print(f"batch_size        = {batch_size}")
+    print(f"context_length    = {context_length}")
+    print(f"vocab_size        = {vocab_size}")
+    print(f"mode              = {mode}")
+    print(f"warmup_steps      = {warmup_steps}")
+    print(f"measurement_steps = {measurement_steps}")
+    print(f"config            = {config}")
+    print("================================")
 
+    # --------------------------------------------------------
+    # Mixed precision context
+    # --------------------------------------------------------
 
-# ---------------------------------------------------------
-# 真正要被 Nsight 捕获的一个 step
-# ---------------------------------------------------------
+    def autocast_context():
+        """
+        FP32:
+            do nothing
 
-def profile_step(
-    model,
-    optimizer,
-    x,
-    y,
-    vocab_size,
-    mode,
-):
-    optimizer.zero_grad(set_to_none=True)
+        BF16:
+            automatically use BF16 for operations such as
+            Linear / matrix multiplication when appropriate.
+        """
 
-    timings = {}
+        if precision == "bf16":
+            if device.type != "cuda":
+                raise RuntimeError(
+                    "BF16 benchmark should be run on a CUDA GPU."
+                )
 
-    # nsys 只捕获这个 range
-    with nvtx.range("profile/measure"):
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError(
+                    "The current GPU does not support BF16."
+                )
+            # 进入这个代码区域以后，PyTorch 自动判断每个运算到底应该使用 BF16 还是 FP32
+            return torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+            )
 
-        # ------------------
-        # Forward
-        # ------------------
-        with nvtx.range("forward"):
-            start = timeit.default_timer()
+        # FP32: no autocast
+        return nullcontext()
 
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
+
+    model = BasicsTransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=config["d_model"],
+        num_layers=config["num_layers"],
+        num_heads=config["num_heads"],
+        d_ff=config["d_ff"],
+        rope_theta=10000.0,
+    ).to(device)
+
+    # --------------------------------------------------------
+    # Optimizer
+    # --------------------------------------------------------
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+    )
+
+    # --------------------------------------------------------
+    # Random input tokens
+    #
+    # x.shape = (batch_size, context_length)
+    # --------------------------------------------------------
+
+    x = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(batch_size, context_length),
+        device=device,
+    )
+
+    # --------------------------------------------------------
+    # Random target tokens
+    #
+    # y.shape = (batch_size, context_length)
+    # --------------------------------------------------------
+
+    y = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(batch_size, context_length),
+        device=device,
+    )
+
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    # ========================================================
+    # One benchmark step
+    # ========================================================
+
+    def run_step():
+        # 清空上一轮梯度
+        optimizer.zero_grad(set_to_none=True)
+
+        # ----------------------------------------------------
+        # Mixed precision only wraps:
+        #
+        # forward
+        # +
+        # loss
+        #
+        # backward 放在 autocast 外
+        # ----------------------------------------------------
+
+        with autocast_context():
+            # logits.shape:
+            #
+            # (B, T, vocab_size)
             logits = model(x)
 
-            torch.cuda.synchronize()
-            timings["forward"] = timeit.default_timer() - start
+            # ------------------------------
+            # Forward only
+            # ------------------------------
+            if mode == "forward":
+                return
 
-        if mode == "forward":
-            return timings
+            # ------------------------------
+            # Compute loss
+            #
+            # logits:
+            # (B, T, V)
+            #
+            # ->
+            #
+            # (B*T, V)
+            #
+            # y:
+            # (B, T)
+            #
+            # ->
+            #
+            # (B*T)
+            # ------------------------------
 
-        # ------------------
-        # Loss
-        # ------------------
-        with nvtx.range("loss"):
-            loss = F.cross_entropy(
+            loss = loss_fn(
                 logits.reshape(-1, vocab_size),
                 y.reshape(-1),
             )
-            torch.cuda.synchronize()
 
-        # ------------------
-        # Backward
-        # ------------------
-        with nvtx.range("backward"):
-            start = timeit.default_timer()
+        # ----------------------------------------------------
+        # backward 不放在 autocast context 中
+        # ----------------------------------------------------
 
-            loss.backward()
+        loss.backward()
 
-            torch.cuda.synchronize()
-            timings["backward"] = timeit.default_timer() - start
+        # ----------------------------------------------------
+        # Full training step
+        # ----------------------------------------------------
 
-        # ------------------
-        # AdamW
-        # ------------------
         if mode == "train":
-            with nvtx.range("optimizer"):
-                start = timeit.default_timer()
+            optimizer.step()
 
-                optimizer.step()
+    # ========================================================
+    # Warm-up
+    # ========================================================
 
-                torch.cuda.synchronize()
-                timings["optimizer"] = timeit.default_timer() - start
+    print(f"\nWarm-up: {warmup_steps} steps")
 
-    return timings
+    for _ in range(warmup_steps):
+        run_step()
+
+        # 等 GPU 真正执行完
+        synchronize(device)
+
+    # ========================================================
+    # Measurement
+    # ========================================================
+
+    times = []
+
+    print(f"Benchmark: {measurement_steps} steps")
+
+    for _ in range(measurement_steps):
+
+        # ------------------------------
+        # 等待之前 GPU 工作完成
+        # ------------------------------
+
+        synchronize(device)
+
+        start = timeit.default_timer()
+
+        run_step()
+
+        # ------------------------------
+        # 等待当前 GPU 工作完成
+        # ------------------------------
+
+        synchronize(device)
+
+        end = timeit.default_timer()
+
+        times.append(end - start)
+
+    # ========================================================
+    # Statistics
+    # ========================================================
+
+    times = np.array(times)
+
+    mean = times.mean()
+    std = times.std()
+
+    print("\n==============================")
+    print(f"model     : {model_size}")
+    print(f"precision : {precision}")
+    print(f"mode      : {mode}")
+    print(f"mean      : {mean * 1000:.3f} ms")
+    print(f"std       : {std * 1000:.3f} ms")
+    print("==============================")
+
+    print("\nraw timings (ms):")
+
+    for i, t in enumerate(times):
+        print(f"{i:02d}: {t * 1000:.3f}")
+
+    return times
 
 
-def main():
+# ============================================================
+# CLI
+# ============================================================
 
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+
+    # --------------------------------------------------------
+    # Model size
+    # --------------------------------------------------------
 
     parser.add_argument(
         "--model-size",
         choices=MODEL_CONFIGS.keys(),
         default="small",
+    )
+
+    # --------------------------------------------------------
+    # Benchmark mode
+    #
+    # forward:
+    #     only model(x)
+    #
+    # forward_backward:
+    #     model(x) + loss + backward
+    #
+    # train:
+    #     model(x) + loss + backward + optimizer.step()
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--mode",
+        choices=[
+            "forward",
+            "forward_backward",
+            "train",
+        ],
+        default="forward",
+    )
+
+    # --------------------------------------------------------
+    # Precision
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--precision",
+        choices=[
+            "fp32",
+            "bf16",
+        ],
+        default="fp32",
+    )
+
+    # --------------------------------------------------------
+    # Input configuration
+    # --------------------------------------------------------
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
     )
 
     parser.add_argument(
@@ -199,16 +387,14 @@ def main():
     )
 
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=4,
-    )
-
-    parser.add_argument(
         "--vocab-size",
         type=int,
         default=10000,
     )
+
+    # --------------------------------------------------------
+    # Benchmark configuration
+    # --------------------------------------------------------
 
     parser.add_argument(
         "--warmup-steps",
@@ -217,106 +403,20 @@ def main():
     )
 
     parser.add_argument(
-        "--mode",
-        choices=[
-            "forward",
-            "forward_backward",
-            "train",
-        ],
-        default="train",
+        "--measurement-steps",
+        type=int,
+        default=10,
     )
 
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("Nsight profiling requires CUDA.")
-
-    device = torch.device("cuda")
-
-    torch.manual_seed(0)
-
-    config = MODEL_CONFIGS[args.model_size]
-
-    print(f"model          = {args.model_size}")
-    print(f"context length = {args.context_length}")
-    print(f"batch size     = {args.batch_size}")
-    print(f"mode           = {args.mode}")
-    print(f"config         = {config}")
-
-    model = BasicsTransformerLM(
-        vocab_size=args.vocab_size,
+    benchmark(
+        model_size=args.model_size,
+        batch_size=args.batch_size,
         context_length=args.context_length,
-        d_model=config["d_model"],
-        num_layers=config["num_layers"],
-        num_heads=config["num_heads"],
-        d_ff=config["d_ff"],
-        rope_theta=10000.0,
-    ).to(device)
-
-    # 使用你自己的 AdamW
-    optimizer = AdamW(
-        model.parameters(),
-        lr=1e-3,
+        vocab_size=args.vocab_size,
+        warmup_steps=args.warmup_steps,
+        measurement_steps=args.measurement_steps,
+        mode=args.mode,
+        precision=args.precision,
     )
-
-    x = torch.randint(
-        0,
-        args.vocab_size,
-        (args.batch_size, args.context_length),
-        device=device,
-    )
-
-    y = torch.randint(
-        0,
-        args.vocab_size,
-        (args.batch_size, args.context_length),
-        device=device,
-    )
-
-    # -----------------------------------------------------
-    # Warm-up
-    # -----------------------------------------------------
-
-    print(f"\nWarm-up: {args.warmup_steps} steps")
-
-    for _ in range(args.warmup_steps):
-        warmup_step(
-            model,
-            optimizer,
-            x,
-            y,
-            args.vocab_size,
-            args.mode,
-        )
-
-    torch.cuda.synchronize()
-
-    # warm-up 完成以后再替换 Attention
-    # 避免 warm-up 的 attention NVTX 混进正式统计
-    model_module.scaled_dot_product_attention = (
-        annotated_scaled_dot_product_attention
-    )
-
-    # -----------------------------------------------------
-    # 只 profile 一个稳定 step
-    # -----------------------------------------------------
-
-    timings = profile_step(
-        model,
-        optimizer,
-        x,
-        y,
-        args.vocab_size,
-        args.mode,
-    )
-
-    print("\n==========================")
-
-    for name, value in timings.items():
-        print(f"{name:10s}: {value * 1000:.3f} ms")
-
-    print("==========================")
-
-
-if __name__ == "__main__":
-    main()
