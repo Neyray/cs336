@@ -100,6 +100,7 @@ def benchmark(
             return
 
         loss = loss_fn(
+            # logits.reshape(B * T, vocab_size)
             logits.reshape(-1, vocab_size),
             y.reshape(-1),
         )

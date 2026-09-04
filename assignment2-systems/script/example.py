@@ -1,10 +1,16 @@
 import argparse
+import math
 import timeit
 
-import numpy as np
 import torch
+import torch.nn.functional as F
+import torch.cuda.nvtx as nvtx
+from einops import einsum
 
+import cs336_basics.model as model_module
 from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.nn_utils import softmax
+from cs336_basics.optimizer import AdamW
 
 
 MODEL_CONFIGS = {
@@ -26,141 +32,158 @@ MODEL_CONFIGS = {
         "num_heads": 20,
         "d_ff": 5120,
     },
-    "xl": {
-        "d_model": 1600,
-        "num_layers": 48,
-        "num_heads": 25,
-        "d_ff": 6400,
-    },
 }
 
 
-def synchronize(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+# ---------------------------------------------------------
+# 给 Attention 内部操作加 NVTX 标签
+# ---------------------------------------------------------
 
+def annotated_scaled_dot_product_attention(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
 
-def benchmark(
-    model_size: str,
-    batch_size: int = 4,
-    context_length: int = 128,
-    vocab_size: int = 10000,
-    warmup_steps: int = 5,
-    measurement_steps: int = 10,
-    mode: str = "forward",
-    lr: float = 1e-3,
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    d_k = K.shape[-1]
 
-    config = MODEL_CONFIGS[model_size]
-
-    print(f"device = {device}")
-    print(f"model = {model_size}")
-    print(config)
-
-    model = BasicsTransformerLM(
-        vocab_size=vocab_size,
-        context_length=context_length,
-        d_model=config["d_model"],
-        num_layers=config["num_layers"],
-        num_heads=config["num_heads"],
-        d_ff=config["d_ff"],
-        rope_theta=10000.0,
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-    )
-
-    # 随机生成 token IDs
-    x = torch.randint(
-        low=0,
-        high=vocab_size,
-        size=(batch_size, context_length),
-        device=device,
-    )
-
-    # 随机生成 target token IDs
-    y = torch.randint(
-        low=0,
-        high=vocab_size,
-        size=(batch_size, context_length),
-        device=device,
-    )
-
-    loss_fn = torch.nn.CrossEntropyLoss()
-
-    def run_step():
-        optimizer.zero_grad(set_to_none=True)
-
-        logits = model(x)
-
-        if mode == "forward":
-            return
-
-        loss = loss_fn(
-            logits.reshape(-1, vocab_size),
-            y.reshape(-1),
+    with nvtx.range("attention/scores"):
+        attention_scores = (
+            einsum(
+                Q,
+                K,
+                "... query d_k, ... key d_k -> ... query key",
+            )
+            / math.sqrt(d_k)
         )
 
-        loss.backward()
+    if mask is not None:
+        with nvtx.range("attention/mask"):
+            attention_scores = torch.where(
+                mask,
+                attention_scores,
+                float("-inf"),
+            )
 
+    with nvtx.range("attention/softmax"):
+        attention_weights = softmax(
+            attention_scores,
+            dim=-1,
+        )
+
+    with nvtx.range("attention/value"):
+        output = einsum(
+            attention_weights,
+            V,
+            "... query key, ... key d_v -> ... query d_v",
+        )
+
+    return output
+
+
+# ---------------------------------------------------------
+# 普通 step：专门用于 warm-up
+# ---------------------------------------------------------
+
+def warmup_step(
+    model,
+    optimizer,
+    x,
+    y,
+    vocab_size,
+    mode,
+):
+
+    optimizer.zero_grad(set_to_none=True)
+
+    logits = model(x)
+
+    if mode == "forward":
+        return
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        y.reshape(-1),
+    )
+
+    loss.backward()
+
+    if mode == "train":
+        optimizer.step()
+
+
+# ---------------------------------------------------------
+# 真正要被 Nsight 捕获的一个 step
+# ---------------------------------------------------------
+
+def profile_step(
+    model,
+    optimizer,
+    x,
+    y,
+    vocab_size,
+    mode,
+):
+    optimizer.zero_grad(set_to_none=True)
+
+    timings = {}
+
+    # nsys 只捕获这个 range
+    with nvtx.range("profile/measure"):
+
+        # ------------------
+        # Forward
+        # ------------------
+        with nvtx.range("forward"):
+            start = timeit.default_timer()
+
+            logits = model(x)
+
+            torch.cuda.synchronize()
+            timings["forward"] = timeit.default_timer() - start
+
+        if mode == "forward":
+            return timings
+
+        # ------------------
+        # Loss
+        # ------------------
+        with nvtx.range("loss"):
+            loss = F.cross_entropy(
+                logits.reshape(-1, vocab_size),
+                y.reshape(-1),
+            )
+            torch.cuda.synchronize()
+
+        # ------------------
+        # Backward
+        # ------------------
+        with nvtx.range("backward"):
+            start = timeit.default_timer()
+
+            loss.backward()
+
+            torch.cuda.synchronize()
+            timings["backward"] = timeit.default_timer() - start
+
+        # ------------------
+        # AdamW
+        # ------------------
         if mode == "train":
-            optimizer.step()
+            with nvtx.range("optimizer"):
+                start = timeit.default_timer()
 
-    # -------------------------
-    # Warm-up
-    # -------------------------
+                optimizer.step()
 
-    print(f"\nWarm-up: {warmup_steps} steps")
+                torch.cuda.synchronize()
+                timings["optimizer"] = timeit.default_timer() - start
 
-    for _ in range(warmup_steps):
-        run_step()
-        synchronize(device)
-
-    # -------------------------
-    # Measurement
-    # -------------------------
-
-    times = []
-
-    print(f"Benchmark: {measurement_steps} steps")
-
-    for _ in range(measurement_steps):
-
-        synchronize(device)
-
-        start = timeit.default_timer()
-
-        run_step()
-
-        synchronize(device)
-
-        end = timeit.default_timer()
-
-        times.append(end - start)
-
-    times = np.array(times)
-
-    mean = times.mean()
-    std = times.std()
-
-    print("\n==============================")
-    print(f"mode: {mode}")
-    print(f"mean: {mean * 1000:.3f} ms")
-    print(f"std : {std * 1000:.3f} ms")
-    print("==============================")
-
-    print("\nraw timings (ms):")
-
-    for i, t in enumerate(times):
-        print(f"{i:02d}: {t * 1000:.3f}")
-
-    return times
+    return timings
 
 
-if __name__ == "__main__":
+def main():
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -170,26 +193,130 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--mode",
-        choices=["forward", "forward_backward", "train"],
-        default="forward",
+        "--context-length",
+        type=int,
+        default=512,
     )
 
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--context-length", type=int, default=128)
-    parser.add_argument("--vocab-size", type=int, default=10000)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+    )
 
-    parser.add_argument("--warmup-steps", type=int, default=5)
-    parser.add_argument("--measurement-steps", type=int, default=10)
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=10000,
+    )
+
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=[
+            "forward",
+            "forward_backward",
+            "train",
+        ],
+        default="train",
+    )
 
     args = parser.parse_args()
 
-    benchmark(
-        model_size=args.model_size,
-        batch_size=args.batch_size,
-        context_length=args.context_length,
+    if not torch.cuda.is_available():
+        raise RuntimeError("Nsight profiling requires CUDA.")
+
+    device = torch.device("cuda")
+
+    torch.manual_seed(0)
+
+    config = MODEL_CONFIGS[args.model_size]
+
+    print(f"model          = {args.model_size}")
+    print(f"context length = {args.context_length}")
+    print(f"batch size     = {args.batch_size}")
+    print(f"mode           = {args.mode}")
+    print(f"config         = {config}")
+
+    model = BasicsTransformerLM(
         vocab_size=args.vocab_size,
-        warmup_steps=args.warmup_steps,
-        measurement_steps=args.measurement_steps,
-        mode=args.mode,
+        context_length=args.context_length,
+        d_model=config["d_model"],
+        num_layers=config["num_layers"],
+        num_heads=config["num_heads"],
+        d_ff=config["d_ff"],
+        rope_theta=10000.0,
+    ).to(device)
+
+    # 使用你自己的 AdamW
+    optimizer = AdamW(
+        model.parameters(),
+        lr=1e-3,
     )
+
+    x = torch.randint(
+        0,
+        args.vocab_size,
+        (args.batch_size, args.context_length),
+        device=device,
+    )
+
+    y = torch.randint(
+        0,
+        args.vocab_size,
+        (args.batch_size, args.context_length),
+        device=device,
+    )
+
+    # -----------------------------------------------------
+    # Warm-up
+    # -----------------------------------------------------
+
+    print(f"\nWarm-up: {args.warmup_steps} steps")
+
+    for _ in range(args.warmup_steps):
+        warmup_step(
+            model,
+            optimizer,
+            x,
+            y,
+            args.vocab_size,
+            args.mode,
+        )
+
+    torch.cuda.synchronize()
+
+    # warm-up 完成以后再替换 Attention
+    # 避免 warm-up 的 attention NVTX 混进正式统计
+    model_module.scaled_dot_product_attention = (
+        annotated_scaled_dot_product_attention
+    )
+
+    # -----------------------------------------------------
+    # 只 profile 一个稳定 step
+    # -----------------------------------------------------
+
+    timings = profile_step(
+        model,
+        optimizer,
+        x,
+        y,
+        args.vocab_size,
+        args.mode,
+    )
+
+    print("\n==========================")
+
+    for name, value in timings.items():
+        print(f"{name:10s}: {value * 1000:.3f} ms")
+
+    print("==========================")
+
+
+if __name__ == "__main__":
+    main()
