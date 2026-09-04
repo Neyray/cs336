@@ -57,6 +57,8 @@ def benchmark(
     mode: str = "forward",
     precision: str = "fp32",
     lr: float = 1e-3,
+    memory_profile:bool=False,
+    snapshot_path:str="memory_snapshot.pickle",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -165,6 +167,55 @@ def benchmark(
 
 
 
+
+
+    # -------------------------
+    # Memory Profiling
+    # -------------------------
+    if memory_profile:
+        if device.type!="cuda":
+            raise RuntimeError("Memory Profile Needs CUDA")
+        
+        # 清空之前记录的峰值，避免 warm-up 干扰
+        torch.cuda.reset_peak_memory_stats(device)
+
+        # 从这里开始记录 CUDA 显存申请 / 释放历史
+        torch.cuda.memory._record_memory_history(
+            max_entries=1_000_000
+        )
+
+
+        # 进行一步run_step()
+        run_step()
+        synchronize(device)
+
+        peak_memory=torch.cuda.max_memory_allocated(device)
+
+
+        # 保存 snapshot
+        torch.cuda.memory._dump_snapshot(snapshot_path)
+
+        # 停止记录
+        torch.cuda.memory._record_memory_history(
+            enabled=None,
+        )
+
+        print("\n==============================")
+        print("Memory profiling")
+        print(f"model     : {model_size}")
+        print(f"context   : {context_length}")
+        print(f"mode      : {mode}")
+        print(f"precision : {precision}")
+        print(f"peak      : {peak_memory / 1024**3:.3f} GiB")
+        print(f"snapshot  : {snapshot_path}")
+        print("==============================")
+
+        return peak_memory
+
+
+
+
+
     # -------------------------
     # Measurement
     # -------------------------
@@ -174,13 +225,13 @@ def benchmark(
     print(f"Benchmark: {measurement_steps} steps")
 
     for _ in range(measurement_steps):
-
+        # 确保前一个 step 的 GPU 工作已经全部结束
         synchronize(device)
 
         start = timeit.default_timer()
 
         run_step()
-
+        # run_step 把 GPU 任务都提交完后，CPU 在这里停下来，直到 GPU 真正完成
         synchronize(device)
 
         end = timeit.default_timer()
@@ -234,6 +285,18 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measurement-steps", type=int, default=10)
 
+    parser.add_argument(
+        "--memory-profile",
+        action="store_true",
+        help="Enable CUDA memory profiling.",
+    )
+
+    parser.add_argument(
+        "--snapshot-path",
+        type=str,
+        default="memory_snapshot.pickle",
+    )
+
     args = parser.parse_args()
 
     benchmark(
@@ -245,4 +308,6 @@ if __name__ == "__main__":
         measurement_steps=args.measurement_steps,
         mode=args.mode,
         precision=args.precision,
+        memory_profile=args.memory_profile,
+        snapshot_path=args.snapshot_path,
     )
