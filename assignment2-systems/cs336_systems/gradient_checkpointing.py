@@ -179,7 +179,7 @@ def forward_with_checkpointing(
             # loop variables after they changed.
             def segment(inp: torch.Tensor, start=start, end=end):
                 return run_layer_range(model.layers, start, end, inp)
-
+            # PyTorch 不会保存 segment 内部所有中间 activation，全部在backward重新计算
             x = checkpoint(segment, x, use_reentrant=False)
 
     x = model.ln_final(x)
