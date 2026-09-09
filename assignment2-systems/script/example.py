@@ -1,389 +1,650 @@
-import argparse
-import csv
-import gc
 import math
-from pathlib import Path
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-
-from cs336_basics.model import (
-    BasicsTransformerLM,
-    RMSNorm,
-    RotaryEmbedding,
-    TransformerBlock,
-)
+import triton
+import triton.language as tl
 
 
-XL_CONFIG = {
-    "vocab_size": 10_000,
-    "context_length": 2048,
-    "d_model": 2560,
-    "num_layers": 32,
-    "num_heads": 32,
-    "d_ff": 10_240,
-    "rope_theta": 10_000.0,
-}
+# ============================================================
+# Part (a): Pure PyTorch FlashAttention-2 forward
+# ============================================================
 
 
-def mib(num_bytes: int) -> float:
-    return num_bytes / (1024**2)
-
-
-def gib(num_bytes: int) -> float:
-    return num_bytes / (1024**3)
-
-
-class SavedTensorStats:
-    """Count tensors that autograd saves for backward."""
-
-    def __init__(self, *, skip_parameters: bool, verbose: bool = True):
-        self.skip_parameters = skip_parameters
-        self.verbose = verbose
-        self.total_size_bytes = 0
-
-    def pack_hook(self, tensor: torch.Tensor):
-        if self.skip_parameters and isinstance(tensor, nn.Parameter):
-            return tensor
-
-        self.total_size_bytes += tensor.numel() * tensor.element_size()
-        if self.verbose:
-            print(
-                "Saving residual: "
-                f"shape={tensor.shape}, dtype={tensor.dtype}, grad_fn={tensor.grad_fn}"
-            )
-        return tensor
-
-    def unpack_hook(self, tensor: torch.Tensor):
-        if self.verbose:
-            print(
-                "Loading residual: "
-                f"shape={tensor.shape}, dtype={tensor.dtype}, grad_fn={tensor.grad_fn}"
-            )
-        return tensor
-
-
-def rmsnorm_residual_demo(device: torch.device) -> None:
-    """Section 3.1: compare eager RMSNorm and torch.compile fused RMSNorm."""
-    x = torch.randn((4, 512, 2560), device=device, requires_grad=True)
-
-    def run(module: nn.Module, title: str) -> None:
-        module.zero_grad(set_to_none=True)
-        x.grad = None
-        stats = SavedTensorStats(skip_parameters=False, verbose=True)
-
-        print(f"\n===== {title} =====")
-        with torch.autograd.graph.saved_tensors_hooks(
-            stats.pack_hook, stats.unpack_hook
-        ):
-            y = module(x)
-            y.sum().backward()
-
-        print(f"Saved tensors: {mib(stats.total_size_bytes):.2f} MiB")
-
-    eager_ln = RMSNorm(x.shape[-1], device=device)
-    run(eager_ln, "RMSNorm (eager)")
-
-    compiled_ln = torch.compile(RMSNorm(x.shape[-1], device=device))
-    run(compiled_ln, "RMSNorm (torch.compile)")
-
-
-def block_residual_demo(device: torch.device) -> None:
-    """Section 3.2 handout demo: saved tensors for one compiled XL-sized block.
-
-    The handout's standalone block example uses num_heads=16 even though the
-    Table-1 XL model uses num_heads=32. We preserve 16 here so the experiment
-    matches the handout example; the full-model sweep below uses the actual
-    Table-1 XL configuration (32 heads).
+class FlashAttentionPyTorch(torch.autograd.Function):
     """
-    if device.type != "cuda":
-        raise RuntimeError("The XL TransformerBlock residual demo should be run on CUDA.")
+    Pure-PyTorch tiled FlashAttention-2 forward.
 
-    batch_size = 4
-    context_length = 2048
-    d_model = 2560
-    d_ff = 10240
-    num_heads = 16
+    Used as a readable reference implementation for debugging
+    the Triton kernel.
+    """
 
-    rope = RotaryEmbedding(
-        context_length=context_length,
-        dim=d_model // num_heads,
-        theta=10_000.0,
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        """
+        Q: [B, Nq, D]
+        K: [B, Nk, D]
+        V: [B, Nk, D]
+
+        Returns:
+            O: [B, Nq, D]
+
+        Also saves:
+            Q, K, V, O, L
+
+        where:
+            L = logsumexp(S, dim=-1)
+        """
+        batch_size, n_queries, d = Q.shape
+        n_keys = K.shape[1]
+
+        scale = 1.0 / math.sqrt(d)
+
+        # Assignment guarantees dimensions are powers of 2
+        # and at least 16, so 16 is a safe tile size.
+        Q_TILE_SIZE = 16
+        K_TILE_SIZE = 16
+
+        O = torch.empty_like(Q)
+
+        # L should be kept in fp32 for numerical stability.
+        L = torch.empty(
+            (batch_size, n_queries),
+            device=Q.device,
+            dtype=torch.float32,
+        )
+
+        # ----------------------------------------------------
+        # Each outer iteration corresponds to one query tile.
+        # ----------------------------------------------------
+        for q_start in range(0, n_queries, Q_TILE_SIZE):
+            q_end = min(q_start + Q_TILE_SIZE, n_queries)
+
+            q = Q[:, q_start:q_end, :]
+
+            # Use fp32 accumulators.
+            q_float = q.float()
+
+            current_q_size = q_end - q_start
+
+            # running max:
+            # [B, Bq]
+            m = torch.full(
+                (batch_size, current_q_size),
+                -float("inf"),
+                device=Q.device,
+                dtype=torch.float32,
+            )
+
+            # running softmax denominator:
+            # [B, Bq]
+            l = torch.zeros(
+                (batch_size, current_q_size),
+                device=Q.device,
+                dtype=torch.float32,
+            )
+
+            # running unnormalized output:
+            # [B, Bq, D]
+            o_acc = torch.zeros(
+                (batch_size, current_q_size, d),
+                device=Q.device,
+                dtype=torch.float32,
+            )
+
+            # ------------------------------------------------
+            # Scan all K/V tiles.
+            # ------------------------------------------------
+            for k_start in range(0, n_keys, K_TILE_SIZE):
+                k_end = min(k_start + K_TILE_SIZE, n_keys)
+
+                k = K[:, k_start:k_end, :].float()
+                v = V[:, k_start:k_end, :].float()
+
+                # S_ij = Q_i K_j^T / sqrt(d)
+                #
+                # [B, Bq, D] @ [B, D, Bk]
+                # ->
+                # [B, Bq, Bk]
+                S = torch.matmul(
+                    q_float,
+                    k.transpose(-1, -2),
+                ) * scale
+
+                # Optional causal masking.
+                if is_causal:
+                    q_indices = torch.arange(
+                        q_start,
+                        q_end,
+                        device=Q.device,
+                    )
+
+                    k_indices = torch.arange(
+                        k_start,
+                        k_end,
+                        device=Q.device,
+                    )
+
+                    causal_mask = (
+                        q_indices[:, None]
+                        >= k_indices[None, :]
+                    )
+
+                    S = torch.where(
+                        causal_mask[None, :, :],
+                        S,
+                        torch.tensor(
+                            -1e6,
+                            device=S.device,
+                            dtype=S.dtype,
+                        ),
+                    )
+
+                # --------------------------------------------
+                # Online softmax
+                # --------------------------------------------
+
+                # m_new = max(m_old, rowmax(S))
+                tile_max = S.max(dim=-1).values
+                m_new = torch.maximum(m, tile_max)
+
+                # alpha = exp(m_old - m_new)
+                alpha = torch.exp(m - m_new)
+
+                # P_tilde = exp(S - m_new)
+                P_tilde = torch.exp(
+                    S - m_new[..., None]
+                )
+
+                # l_new =
+                #   alpha * l_old
+                #   + rowsum(P_tilde)
+                l = (
+                    alpha * l
+                    + P_tilde.sum(dim=-1)
+                )
+
+                # O_new =
+                #   alpha * O_old
+                #   + P_tilde @ V
+                o_acc = (
+                    alpha[..., None] * o_acc
+                    + torch.matmul(P_tilde, v)
+                )
+
+                m = m_new
+
+            # ------------------------------------------------
+            # Finish normalization.
+            # ------------------------------------------------
+
+            O[:, q_start:q_end, :] = (
+                o_acc / l[..., None]
+            ).to(Q.dtype)
+
+            # L = m + log(l)
+            L[:, q_start:q_end] = (
+                m + torch.log(l)
+            )
+
+        # Required for the later backward pass.
+        ctx.save_for_backward(
+            Q,
+            K,
+            V,
+            O,
+            L,
+        )
+
+        ctx.is_causal = bool(is_causal)
+
+        return O
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # 4.2.2 only requires forward.
+        # Backward belongs to the following problem.
+        raise NotImplementedError(
+            "FlashAttention backward is implemented in the next problem."
+        )
+
+
+# ============================================================
+# Part (b/c): Triton FlashAttention-2 forward kernel
+# ============================================================
+
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    O_ptr,
+    L_ptr,
+
+    stride_qb,
+    stride_qq,
+    stride_qd,
+
+    stride_kb,
+    stride_kk,
+    stride_kd,
+
+    stride_vb,
+    stride_vk,
+    stride_vd,
+
+    stride_ob,
+    stride_oq,
+    stride_od,
+
+    stride_lb,
+    stride_lq,
+
+    N_QUERIES,
+    N_KEYS,
+    scale,
+
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    # ========================================================
+    # One Triton program handles:
+    #
+    #   one batch
+    #   +
+    #   one Q tile
+    # ========================================================
+
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    # --------------------------------------------------------
+    # Q tile pointer
+    # --------------------------------------------------------
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(
+            query_tile_index * Q_TILE_SIZE,
+            0,
+        ),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
     )
-    block = TransformerBlock(
-        d_model=d_model,
-        d_ff=d_ff,
-        num_heads=num_heads,
-        positional_encoder=rope,
-    ).to(device)
 
-    block = torch.compile(block, fullgraph=True)
-    x = torch.randn(
-        (batch_size, context_length, d_model),
-        device=device,
-        requires_grad=True,
+    # --------------------------------------------------------
+    # K starts from the first key tile.
+    # --------------------------------------------------------
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
     )
 
-    stats = SavedTensorStats(skip_parameters=True, verbose=False)
-    with torch.autograd.graph.saved_tensors_hooks(
-        stats.pack_hook, stats.unpack_hook
+    # --------------------------------------------------------
+    # V starts from the first key tile.
+    # --------------------------------------------------------
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    # --------------------------------------------------------
+    # Output tile corresponding to this Q tile.
+    # --------------------------------------------------------
+
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(
+            query_tile_index * Q_TILE_SIZE,
+            0,
+        ),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    # --------------------------------------------------------
+    # L contains one scalar per query.
+    # --------------------------------------------------------
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(
+            query_tile_index * Q_TILE_SIZE,
+        ),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    # ========================================================
+    # Load Q once.
+    #
+    # This Q tile remains on-chip while we scan K/V tiles.
+    # ========================================================
+
+    Q = tl.load(Q_block_ptr)
+
+    # ========================================================
+    # Online-softmax state.
+    # Keep these in fp32.
+    # ========================================================
+
+    # m: [Bq]
+    m = tl.full(
+        (Q_TILE_SIZE,),
+        -float("inf"),
+        tl.float32,
+    )
+
+    # l: [Bq]
+    l = tl.zeros(
+        (Q_TILE_SIZE,),
+        dtype=tl.float32,
+    )
+
+    # O accumulator: [Bq, D]
+    O_acc = tl.zeros(
+        (Q_TILE_SIZE, D),
+        dtype=tl.float32,
+    )
+
+    # Query indices are constant for this program.
+    q_indices = (
+        query_tile_index * Q_TILE_SIZE
+        + tl.arange(0, Q_TILE_SIZE)
+    )
+
+    # ========================================================
+    # Single loop over K/V tiles.
+    # ========================================================
+
+    for k_start in range(
+        0,
+        N_KEYS,
+        K_TILE_SIZE,
     ):
-        _ = block(x)
+        # ----------------------------------------------------
+        # Load one K/V tile from global memory.
+        # ----------------------------------------------------
 
-    torch.cuda.synchronize(device)
-    print(
-        "Total size of saved tensors in single TransformerBlock: "
-        f"{mib(stats.total_size_bytes):.2f} MiB"
-    )
+        K = tl.load(K_block_ptr)
+        V = tl.load(V_block_ptr)
 
+        # ----------------------------------------------------
+        # S = Q K^T / sqrt(d)
+        #
+        # [Bq, D] @ [D, Bk]
+        # ->
+        # [Bq, Bk]
+        # ----------------------------------------------------
 
-def run_layer_range(
-    layers: nn.ModuleList,
-    start: int,
-    end: int,
-    x: torch.Tensor,
-) -> torch.Tensor:
-    for i in range(start, end):
-        x = layers[i](x)
-    return x
+        S = tl.dot(
+            Q,
+            tl.trans(K),
+        ) * scale
 
+        # ----------------------------------------------------
+        # Part (c): causal mask
+        # ----------------------------------------------------
 
-def forward_with_checkpointing(
-    model: BasicsTransformerLM,
-    token_ids: torch.Tensor,
-    group_size: int,
-) -> torch.Tensor:
-    """Run the LM while checkpointing consecutive Transformer blocks.
-
-    group_size=1  -> checkpoint each TransformerBlock separately
-    group_size=2  -> checkpoint every two TransformerBlocks
-    group_size=4  -> checkpoint every four TransformerBlocks
-    group_size=0  -> no checkpointing (baseline; likely OOM for XL/2048)
-    """
-    x = model.token_embeddings(token_ids)
-
-    if group_size == 0:
-        for layer in model.layers:
-            x = layer(x)
-    else:
-        if group_size < 1:
-            raise ValueError("group_size must be >= 1, or 0 for the baseline")
-
-        n_layers = len(model.layers)
-        for start in range(0, n_layers, group_size):
-            end = min(start + group_size, n_layers)
-
-            # Bind start/end now; otherwise Python's closure would see the
-            # loop variables after they changed.
-            def segment(inp: torch.Tensor, start=start, end=end):
-                return run_layer_range(model.layers, start, end, inp)
-
-            x = checkpoint(segment, x, use_reentrant=False)
-
-    x = model.ln_final(x)
-    return model.lm_head(x)
-
-
-def recursive_checkpoint_forward(
-    layers: nn.ModuleList,
-    x: torch.Tensor,
-    start: int = 0,
-    end: int | None = None,
-) -> torch.Tensor:
-    """Balanced recursive checkpointing sketch for problem 3(a).
-
-    This is included as the code sketch for the asymptotic argument. The
-    measured experiment in part (b) intentionally does NOT call this function,
-    because part (b) forbids nested checkpoint calls.
-    """
-    if end is None:
-        end = len(layers)
-
-    if end - start == 1:
-        return layers[start](x)
-
-    mid = (start + end) // 2
-
-    def left(inp: torch.Tensor):
-        return recursive_checkpoint_forward(layers, inp, start, mid)
-
-    def right(inp: torch.Tensor):
-        return recursive_checkpoint_forward(layers, inp, mid, end)
-
-    x = checkpoint(left, x, use_reentrant=False)
-    x = checkpoint(right, x, use_reentrant=False)
-    return x
-
-
-def one_backward_step(
-    model: BasicsTransformerLM,
-    token_ids: torch.Tensor,
-    targets: torch.Tensor,
-    group_size: int,
-) -> tuple[float, float, float]:
-    model.zero_grad(set_to_none=True)
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(token_ids.device)
-
-    baseline_bytes = torch.cuda.memory_allocated(token_ids.device)
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
-    logits = forward_with_checkpointing(model, token_ids, group_size)
-    loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        targets.reshape(-1),
-    )
-    loss.backward()
-    end.record()
-
-    torch.cuda.synchronize(token_ids.device)
-
-    peak_bytes = torch.cuda.max_memory_allocated(token_ids.device)
-    elapsed_ms = start.elapsed_time(end)
-
-    return gib(baseline_bytes), gib(peak_bytes), elapsed_ms
-
-
-def checkpoint_sweep(
-    group_sizes: list[int],
-    output_csv: str | None,
-    batch_size: int = 4,
-) -> None:
-    """Problem 3(b): sweep non-nested checkpoint segment sizes on XL/2048."""
-    if not torch.cuda.is_available():
-        raise RuntimeError("Checkpoint memory profiling requires a CUDA GPU.")
-
-    device = torch.device("cuda")
-    torch.manual_seed(0)
-    torch.cuda.manual_seed_all(0)
-
-    print("Creating Table-1 XL model:")
-    print(XL_CONFIG)
-    model = BasicsTransformerLM(**XL_CONFIG).to(device)
-    model.train()
-
-    token_ids = torch.randint(
-        0,
-        XL_CONFIG["vocab_size"],
-        (batch_size, XL_CONFIG["context_length"]),
-        device=device,
-    )
-    targets = torch.randint(
-        0,
-        XL_CONFIG["vocab_size"],
-        (batch_size, XL_CONFIG["context_length"]),
-        device=device,
-    )
-
-    rows: list[dict[str, float | int | str]] = []
-
-    print("\ncheckpoint sweep")
-    print("group_size | checkpoints | baseline_GiB | peak_GiB | step_ms")
-    print("-----------+-------------+--------------+----------+--------")
-
-    for group_size in group_sizes:
-        if group_size < 0:
-            raise ValueError("group sizes must be >= 0")
-
-        checkpoints = (
-            0
-            if group_size == 0
-            else math.ceil(XL_CONFIG["num_layers"] / group_size)
-        )
-
-        try:
-            baseline_gib, peak_gib, elapsed_ms = one_backward_step(
-                model=model,
-                token_ids=token_ids,
-                targets=targets,
-                group_size=group_size,
+        if IS_CAUSAL:
+            k_indices = (
+                k_start
+                + tl.arange(0, K_TILE_SIZE)
             )
-            status = "ok"
-            print(
-                f"{group_size:10d} | {checkpoints:11d} | "
-                f"{baseline_gib:12.3f} | {peak_gib:8.3f} | {elapsed_ms:7.1f}"
+
+            causal_mask = (
+                q_indices[:, None]
+                >= k_indices[None, :]
             )
-        except torch.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            baseline_gib = float("nan")
-            peak_gib = float("nan")
-            elapsed_ms = float("nan")
-            status = "OOM"
-            print(f"{group_size:10d} | {checkpoints:11d} |          OOM")
 
-        rows.append(
-            {
-                "group_size": group_size,
-                "num_checkpoints": checkpoints,
-                "baseline_gib": baseline_gib,
-                "peak_gib": peak_gib,
-                "step_ms": elapsed_ms,
-                "status": status,
-            }
+            S = tl.where(
+                causal_mask,
+                S,
+                -1.0e6,
+            )
+
+        # ====================================================
+        # Online softmax
+        # ====================================================
+
+        # rowmax of current tile
+        tile_max = tl.max(
+            S,
+            axis=1,
         )
 
-        model.zero_grad(set_to_none=True)
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    valid_rows = [row for row in rows if row["status"] == "ok"]
-    if valid_rows:
-        best = min(valid_rows, key=lambda row: float(row["peak_gib"]))
-        print(
-            "\nMeasured minimum: "
-            f"group_size={best['group_size']}, peak={float(best['peak_gib']):.3f} GiB"
+        # m_new
+        m_new = tl.maximum(
+            m,
+            tile_max,
         )
 
-    if output_csv is not None:
-        output_path = Path(output_csv)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"Saved results to {output_path}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--experiment",
-        choices=["rmsnorm", "block", "checkpoint"],
-        required=True,
-    )
-    parser.add_argument(
-        "--group-sizes",
-        nargs="+",
-        type=int,
-        default=[1, 2, 4, 8, 16, 32],
-        help="Consecutive blocks per non-nested checkpoint. Use 0 for baseline.",
-    )
-    parser.add_argument(
-        "--output-csv",
-        default="results/gradient_checkpointing.csv",
-    )
-    parser.add_argument("--batch-size", type=int, default=4)
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if args.experiment == "rmsnorm":
-        rmsnorm_residual_demo(device)
-    elif args.experiment == "block":
-        block_residual_demo(device)
-    else:
-        checkpoint_sweep(
-            group_sizes=args.group_sizes,
-            output_csv=args.output_csv,
-            batch_size=args.batch_size,
+        # alpha =
+        # exp(m_old - m_new)
+        alpha = tl.exp(
+            m - m_new
         )
 
+        # P_tilde =
+        # exp(S - m_new)
+        P_tilde = tl.exp(
+            S - m_new[:, None]
+        )
 
-if __name__ == "__main__":
-    main()
+        # ----------------------------------------------------
+        # Update denominator:
+        #
+        # l_new =
+        # alpha * l_old
+        # + rowsum(P_tilde)
+        # ----------------------------------------------------
+
+        l = (
+            alpha * l
+            + tl.sum(
+                P_tilde,
+                axis=1,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Rescale previous output.
+        # ----------------------------------------------------
+
+        O_acc = (
+            O_acc
+            * alpha[:, None]
+        )
+
+        # ----------------------------------------------------
+        # Add contribution from current V tile.
+        #
+        # O += P_tilde @ V
+        # ----------------------------------------------------
+
+        P_for_dot = P_tilde.to(V.dtype)
+
+        O_acc = tl.dot(
+            P_for_dot,
+            V,
+            acc=O_acc,
+        )
+
+        # Advance running maximum.
+        m = m_new
+
+        # ----------------------------------------------------
+        # Move K/V block pointers to next tile.
+        # ----------------------------------------------------
+
+        K_block_ptr = K_block_ptr.advance(
+            (K_TILE_SIZE, 0)
+        )
+
+        V_block_ptr = V_block_ptr.advance(
+            (K_TILE_SIZE, 0)
+        )
+
+    # ========================================================
+    # Final normalization
+    # ========================================================
+
+    O_acc = (
+        O_acc
+        / l[:, None]
+    )
+
+    # logsumexp:
+    #
+    # L = m + log(l)
+    L = m + tl.log(l)
+
+    # ========================================================
+    # Write results back to global memory.
+    # ========================================================
+
+    tl.store(
+        O_block_ptr,
+        O_acc.to(
+            O_block_ptr.type.element_ty
+        ),
+    )
+
+    tl.store(
+        L_block_ptr,
+        L,
+    )
+
+
+# ============================================================
+# Autograd wrapper around Triton kernel
+# ============================================================
+
+
+# 负责准备输入和启动 kernel
+class FlashAttentionTriton(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        Q,
+        K,
+        V,
+        is_causal=False,
+    ):
+        if not Q.is_cuda:
+            raise RuntimeError(
+                "FlashAttentionTriton requires CUDA tensors."
+            )
+
+        batch_size, n_queries, d = Q.shape
+        n_keys = K.shape[1]
+
+        O = torch.empty_like(Q)
+
+        L = torch.empty(
+            (batch_size, n_queries),
+            device=Q.device,
+            dtype=torch.float32,
+        )
+
+        # 16 is safe because the assignment guarantees
+        # dimensions are powers of 2 and >= 16.
+        Q_TILE_SIZE = 16
+        K_TILE_SIZE = 16
+
+        # Number of query tiles.
+        n_query_tiles = triton.cdiv(
+            n_queries,
+            Q_TILE_SIZE,
+        )
+
+        # ----------------------------------------------------
+        # grid:
+        #
+        # dimension 0 -> query tile
+        # dimension 1 -> batch
+        #
+        # one program =
+        # one batch + one query tile
+        # ----------------------------------------------------
+
+        grid = (
+            n_query_tiles,
+            batch_size,
+        )
+
+        flash_fwd_kernel[grid](
+            Q,
+            K,
+            V,
+            O,
+            L,
+
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+
+            K.stride(0),
+            K.stride(1),
+            K.stride(2),
+
+            V.stride(0),
+            V.stride(1),
+            V.stride(2),
+
+            O.stride(0),
+            O.stride(1),
+            O.stride(2),
+
+            L.stride(0),
+            L.stride(1),
+
+            n_queries,
+            n_keys,
+
+            1.0 / math.sqrt(d),
+
+            D=d,
+            Q_TILE_SIZE=Q_TILE_SIZE,
+            K_TILE_SIZE=K_TILE_SIZE,
+            IS_CAUSAL=is_causal,
+        )
+
+        # Save exactly one [B, Nq] tensor: L.
+        # The existing tests inspect saved_tensors.
+        ctx.save_for_backward(
+            Q,
+            K,
+            V,
+            O,
+            L,
+        )
+
+        ctx.is_causal = bool(is_causal)
+
+        return O
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # This is the next problem, not 4.2.2.
+        raise NotImplementedError(
+            "FlashAttention backward is implemented in the next problem."
+        )
