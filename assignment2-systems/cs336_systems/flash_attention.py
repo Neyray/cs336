@@ -487,7 +487,7 @@ GPU program 的片上工作数据
         # ----------------------------------------------------
         # Rescale previous output.
         # ----------------------------------------------------
-
+        # 不是矩阵相乘，而是缩放
         O_acc = (
             O_acc
             * alpha[:, None]
@@ -590,6 +590,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         K_TILE_SIZE = 16
 
         # Number of query tiles.
+        # 向上取整
         n_query_tiles = triton.cdiv(
             n_queries,
             Q_TILE_SIZE,
