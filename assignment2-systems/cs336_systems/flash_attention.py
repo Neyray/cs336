@@ -539,7 +539,7 @@ GPU program 的片上工作数据
     # ========================================================
     # Write results back to global memory.
     # ========================================================
-
+    # 把 Triton kernel 算出来的数值写进 GPU 内存中的 Tensor
     tl.store(
         O_block_ptr,
         O_acc.to(
@@ -651,6 +651,7 @@ class FlashAttentionTriton(torch.autograd.Function):
 
         # Save exactly one [B, Nq] tensor: L.
         # The existing tests inspect saved_tensors.
+        # 告诉 PyTorch autograd：这些 Tensor 在 backward 时还要用，请保留下来，并让我届时能取到
         ctx.save_for_backward(
             Q,
             K,
