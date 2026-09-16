@@ -10,6 +10,13 @@ from cs336_systems.flash_attention import (
 
 from cs336_systems.ddp import DDP
 
+
+
+
+from cs336_systems.ddp_overlap_individual_parameters import (
+    DDPOverlapIndividualParameters,
+)
+
 def get_flashattention_autograd_function_pytorch() -> type:
     """
     Returns a torch.autograd.Function subclass that implements FlashAttention2.
@@ -55,7 +62,7 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDP(module)
-    return DDP(module)
+    return DDPOverlapIndividualParameters(module)
 
 
 def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -70,7 +77,7 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    ddp_model.finish_gradient_sychronization()
+    ddp_model.finish_gradient_synchronization()
 
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
