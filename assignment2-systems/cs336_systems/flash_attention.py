@@ -5,6 +5,44 @@ import triton
 import triton.language as tl
 
 
+@torch.compile(fullgraph=True, dynamic=True)
+def flash_attention_backward(Q, K, V, output, grad_output, logsumexp, is_causal):
+    """Recompute attention probabilities from logsumexp, following equations 13-19.
+
+    Both forward implementations share this compiled PyTorch backward.
+    Accumulate in fp32, then return gradients in the input dtypes.
+    """
+    q, k, v = Q.float(), K.float(), V.float()
+    do = grad_output.float()
+    scale = 1.0 / math.sqrt(Q.shape[-1])
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+    if is_causal:
+        query_indices = torch.arange(Q.shape[1], device=Q.device)
+        key_indices = torch.arange(K.shape[1], device=Q.device)
+        causal_mask = query_indices[:, None] >= key_indices[None, :]
+        scores = scores.masked_fill(~causal_mask, -1e6)
+
+    probabilities = torch.exp(scores - logsumexp[..., None])
+    # D_i = sum_d(dO_id * O_id) avoids recomputing a softmax reduction.
+    D = (do * output.float()).sum(dim=-1, keepdim=True)
+    dV = torch.matmul(probabilities.transpose(-1, -2), do)
+    dP = torch.matmul(do, v.transpose(-1, -2))
+    dS = probabilities * (dP - D)
+    if is_causal:
+        # Masked scores are constants, so their gradients must be zero.
+        dS = dS.masked_fill(~causal_mask, 0.0)
+    dQ = torch.matmul(dS, k) * scale
+    dK = torch.matmul(dS.transpose(-1, -2), q) * scale
+    return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype)
+
+
+def _backward_from_context(ctx, grad_output):
+    Q, K, V, output, logsumexp = ctx.saved_tensors
+    gradients = flash_attention_backward(Q, K, V, output, grad_output, logsumexp, ctx.is_causal)
+    # apply(Q, K, V) omits the optional is_causal input entirely.
+    return (*gradients, None)[:len(ctx.needs_input_grad)]
+
+
 # ============================================================
 # Part (a): Pure PyTorch FlashAttention-2 forward
 # ============================================================
@@ -12,7 +50,7 @@ import triton.language as tl
 # 纯 PyTorch 参考实现，方便理解/对拍
 class FlashAttentionPyTorch(torch.autograd.Function):
     """
-    Pure-PyTorch tiled FlashAttention-2 forward.
+    Pure-PyTorch tiled FlashAttention-2 forward with compiled backward.
 
     Used as a readable reference implementation for debugging
     the Triton kernel.
@@ -186,7 +224,7 @@ class FlashAttentionPyTorch(torch.autograd.Function):
                 m + torch.log(l)
             )
 
-        # Required for the later backward pass.
+        # Saved tensors shared by the compiled backward pass.
         ctx.save_for_backward(
             Q,
             K,
@@ -201,11 +239,7 @@ class FlashAttentionPyTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # 4.2.2 only requires forward.
-        # Backward belongs to the following problem.
-        raise NotImplementedError(
-            "FlashAttention backward is implemented in the next problem."
-        )
+        return _backward_from_context(ctx, grad_output)
 
 
 # ============================================================
@@ -666,7 +700,4 @@ class FlashAttentionTriton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        # This is the next problem, not 4.2.2.
-        raise NotImplementedError(
-            "FlashAttention backward is implemented in the next problem."
-        )
+        return _backward_from_context(ctx, grad_output)

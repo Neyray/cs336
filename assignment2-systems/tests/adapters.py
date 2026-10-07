@@ -3,21 +3,6 @@ from __future__ import annotations
 import torch
 
 
-from cs336_systems.flash_attention import (
-    FlashAttentionPyTorch,
-    FlashAttentionTriton,
-)
-
-from cs336_systems.ddp import DDP
-
-
-
-
-from cs336_systems.ddp_overlap_individual_parameters import (
-    DDPOverlapIndividualParameters,
-)
-from cs336_systems.fsdp import FullyShardedDataParallel
-
 def get_flashattention_autograd_function_pytorch() -> type:
     """
     Returns a torch.autograd.Function subclass that implements FlashAttention2.
@@ -27,6 +12,8 @@ def get_flashattention_autograd_function_pytorch() -> type:
     Returns:
         A class object (not an instance of the class)
     """
+    from cs336_systems.flash_attention import FlashAttentionPyTorch
+
     return FlashAttentionPyTorch
 
 
@@ -36,12 +23,14 @@ def get_flashattention_autograd_function_triton() -> type:
     using Triton kernels.
     The expectation is that this class will implement the same operations
     as the class you return in get_flashattention_autograd_function_pytorch(),
-    but it should do so by invoking custom Triton kernels in the forward
-    and backward passes.
+    using a custom Triton forward kernel and the compiled PyTorch backward
+    required by the assignment. A custom Triton backward is optional.
 
     Returns:
         A class object (not an instance of the class)
     """
+    from cs336_systems.flash_attention import FlashAttentionTriton
+
     return FlashAttentionTriton
 
 
@@ -51,7 +40,7 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
     parameter broadcasting and gradient synchronization for
     distributed data parallel training.
 
-    This container should overlaps communication with backprop computation
+    This container should overlap communication with backprop computation
     by asynchronously communicating gradients as they are ready
     in the backward pass. The gradient for each parameter tensor
     is individually communicated.
@@ -62,7 +51,8 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
     Returns:
         Instance of a DDP class.
     """
-    # For example: return DDP(module)
+    from cs336_systems.ddp_overlap_individual_parameters import DDPOverlapIndividualParameters
+
     return DDPOverlapIndividualParameters(module)
 
 
@@ -77,7 +67,6 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    # For example: ddp_model.finish_gradient_synchronization()
     ddp_model.finish_gradient_synchronization()
 
 
@@ -96,8 +85,9 @@ def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) 
     Returns:
         Instance of an FSDP class.
     """
-    # For example: return FSDP(module, compute_dtype=compute_dtype)
-    return FullyShardedDataParallel(module,compute_dtype)
+    from cs336_systems.fsdp import FullyShardedDataParallel
+
+    return FullyShardedDataParallel(module, compute_dtype=compute_dtype)
 
 
 def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -138,7 +128,7 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
         params (``Iterable``): an ``Iterable`` of :class:`torch.Tensor` s
             or :class:`dict` s giving all parameters, which will be sharded
             across ranks.
-        optimizer_class (:class:`torch.nn.Optimizer`): the class of the local
+        optimizer_cls (:class:`torch.optim.Optimizer`): the class of the local
             optimizer.
     Keyword arguments:
         kwargs: keyword arguments to be forwarded to the optimizer constructor.
